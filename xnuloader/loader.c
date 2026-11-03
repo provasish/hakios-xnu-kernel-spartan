@@ -261,6 +261,12 @@ clean_dcache(uint64_t start, uint64_t end)
 /* ------------------------------------------------------------------------ */
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
+/*
+ * Set on spartan (efi_main()): realme's logdump is the phone's own log area, and what it keeps there is not known, so
+ * nothing is written to it; the log comes back over USB ("oem log", "upload") and on the screen instead.
+ */
+static int log_partition_off;
+
 static efi_block_io *
 find_log_partition(void)
 {
@@ -270,6 +276,9 @@ find_log_partition(void)
 	efi_handle *handles;
 	uint64_t count;
 
+	if (log_partition_off) {
+		return NULL;
+	}
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
 		return NULL;
 	}
@@ -584,6 +593,22 @@ static const struct platform platform_redwood = {
 	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-7 Cortex-A78s (2.4 GHz): a big one is about
 	 * 2.5 times as fast. The kernel uses the small ones only when the big ones are all busy
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
+	 */
+	.small_cores = 0x0f,
+};
+
+static const struct platform platform_spartan = {
+	/*
+	 * The realme GT Neo 3T (SM8250-AC): its GICv3 is where the SC7280's is (sm8250.dtsi, interrupt-controller@17a00000),
+	 * and the peripherals fit the same window. Not yet run on the phone. The hypervisor watchdog and the charger
+	 * protocols (wdt_arm(), charger_start()) stay off here until they are seen to answer the way they do on redwood.
+	 */
+	.name = "spartan", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/*
+	 * Cores 0-3 are Cortex-A55s (1.8 GHz at most), 4-6 Cortex-A77s (2.42 GHz) and 7 the one at 3.2 GHz
+	 * (sm8250.dtsi: cpu@0 ... cpu@700, numbered in the second affinity field).
 	 */
 	.small_cores = 0x0f,
 };
@@ -4345,6 +4370,9 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
 		if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
+		} else if (SCREEN.base == 0x9C000000ULL) {
+			PLAT = &platform_spartan;   /* kona's continuous-splash memory, as ABL leaves it */
+			log_partition_off = 1;
 		} else {
 			ramfb_phone_screen();
 		}
