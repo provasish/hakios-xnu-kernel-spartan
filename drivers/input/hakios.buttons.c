@@ -48,6 +48,7 @@
 #include <kern/thread_call.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
@@ -231,8 +232,12 @@ find_channel(struct peripheral *p, uint32_t channels)
 /* the power-on block, of the kind that is split in two ("generation 3"): this is its half for the operating system */
 #define PON_TYPE                0x01
 #define PON_SUBTYPE_HLOS        0x09
+#define SPARTAN_PON_SUBTYPE_MIN  0x01           /* qpnp-power-on: primary through gen2 secondary */
+#define SPARTAN_PON_SUBTYPE_MAX  0x05
 #define PON_KPDPWR              0x80            /* in the status and in the interrupt registers */
 #define PON_RESIN               0x40
+static uint8_t pon_power_mask = PON_KPDPWR, pon_resin_mask = PON_RESIN;
+static bool spartan;
 
 /* a GPIO of the low or medium voltage kind */
 #define GPIO_TYPE               0x10
@@ -319,8 +324,8 @@ buttons_poll(void)
 	if (power.usable || volume_down.usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(&power, status & pon_power_mask);
+			button_look(&volume_down, status & pon_resin_mask);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
@@ -369,7 +374,7 @@ pon_inputs(void)
 	const char *problem;
 	uint8_t r[8], more[2];
 
-	printf("buttons: next: read the status and the interrupt setup of %s (registers 0x1310 to 0x1319)\n", pon.name);
+	printf("buttons: next: read the status and the interrupt setup of %s (peripheral offsets 0x10 to 0x19)\n", pon.name);
 	problem = spmi_read(&pon, REG_RT_STATUS, r, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pon, REG_INT_LATCHED, more, 2);
@@ -379,12 +384,12 @@ pon_inputs(void)
 		return;
 	}
 	printf("buttons: power-on block: status %#x (power %s, volume down %s); interrupts: edge %#x, high %#x, low %#x, "
-	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
-	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
+	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & pon_power_mask) ? "HELD" : "released",
+	    (r[0] & pon_resin_mask) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
 	power.usable = volume_down.usable = true;
-	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	power.last = r[0] & pon_power_mask;
+	volume_down.last = r[0] & pon_resin_mask;
 }
 
 /* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
@@ -395,7 +400,7 @@ pin_input(void)
 	uint8_t c[8], status = 0;
 	unsigned mode, pull;
 
-	printf("buttons: next: read the setup and the level of %s (registers 0x8d40 to 0x8d47, 0x8d10)\n", pin.name);
+	printf("buttons: next: read the setup and the level of %s (peripheral offsets 0x40 to 0x47, 0x10)\n", pin.name);
 	problem = spmi_read(&pin, GPIO_REG_MODE, c, 8);
 	if (problem == NULL) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
@@ -441,6 +446,10 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	if (!arb_core || !arb_cnfg || !arb_observer) {
+		printf("buttons: could not map the PMIC arbiter\n");
+		goto out;
+	}
 	version = rd(arb_core + ARB_VERSION);
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
 	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
@@ -463,7 +472,8 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	}
 
 	printf("buttons: step 3: the first transfers on the SPMI bus\n");
-	pon_known = identify(&pon, PON_TYPE, PON_SUBTYPE_HLOS, PON_SUBTYPE_HLOS);
+	pon_known = identify(&pon, PON_TYPE, spartan ? SPARTAN_PON_SUBTYPE_MIN : PON_SUBTYPE_HLOS,
+	    spartan ? SPARTAN_PON_SUBTYPE_MAX : PON_SUBTYPE_HLOS);
 	pin_known = identify(&pin, GPIO_TYPE, GPIO_SUBTYPE_LV, GPIO_SUBTYPE_MV_VIN3);
 	if (steps < 4) {
 		goto out;
@@ -561,19 +571,47 @@ press_power_init(void)
 	    seconds + 10);
 }
 
+static bool
+is_spartan_platform(void)
+{
+	static const char platform[] = "spartan";
+	const void *value;
+	unsigned int size;
+	DTEntry arm_io;
+
+	return SecureDTLookupEntry(NULL, "/arm-io", &arm_io) == kSuccess &&
+	    SecureDTGetProperty(arm_io, "device_type", &value, &size) == kSuccess &&
+	    size == sizeof(platform) && memcmp(value, platform, sizeof(platform)) == 0;
+}
+
 void
 hakios_buttons_init(void)
 {
 	uint32_t enabled = 0, steps = 5;
 	thread_t thread;
 
-	press_power_init();
+	spartan = is_spartan_platform();
+	if (spartan) {
+		if (!PE_parse_boot_argn("spartan_buttons", &enabled, sizeof(enabled)) || enabled != 1) {
+			return;
+		}
+		/* Spartan's PM8150 uses the legacy PON RT status: KPDPWR bit 0, RESIN bit 1. */
+		pon.name = "PM8150 PON";
+		pon.id = 0x008;
+		pin.name = "PM8150 GPIO6";
+		pin.id = 0x0c5;
+		pon_power_mask = 0x01;
+		pon_resin_mask = 0x02;
+	} else {
+		press_power_init();
+	}
+
 
 	/*
 	 * On with the touch screen (the phone, somebody at it) unless buttons=0 says otherwise: a hand
 	 * has pressed all three keys and each press and release was read as it was made.
 	 */
-	if (!PE_parse_boot_argn("buttons", &enabled, sizeof(enabled))) {
+	if (!spartan && !PE_parse_boot_argn("buttons", &enabled, sizeof(enabled))) {
 		uint32_t touch_screen = 0;
 
 		enabled = PE_parse_boot_argn("touchscreen", &touch_screen, sizeof(touch_screen)) && touch_screen != 0;
