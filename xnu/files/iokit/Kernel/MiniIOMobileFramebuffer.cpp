@@ -246,6 +246,7 @@ micros(uint64_t absolute)
  */
 static TUNABLE(uint32_t, gMeasure, "fb_measure", 0);
 #define DPU_SC7280_INTF1        0x0ae36000UL            /* SM7325 (sc7280): INTF_1, what the panel of redwood is on */
+#define DPU_SM8250_INTF1        0x0ae6b800UL            /* SM8250 (kona): INTF_1, MDSS + 0x6b800 (dpu_6_0_sm8250); spartan's panel, fb_probe=1 */
 #define INTF_TIMING_ENGINE_EN   0x000
 #define INTF_FRAME_COUNT        0x0ac
 #define INTF_LINE_COUNT         0x0b0                   /* the line the interface is scanning (Linux's dpu_hw_intf.c) */
@@ -276,8 +277,12 @@ panelInterface(void)
 	char version[128] = "";
 	uint64_t physical = gIntfPhysical;
 
-	if (physical == 0 && PE_parse_boot_argn("hakios_kver", version, sizeof(version)) && strnstr(version, "-sc7280-", sizeof(version)) != NULL) {
-		physical = DPU_SC7280_INTF1;
+	if (physical == 0 && PE_parse_boot_argn("hakios_kver", version, sizeof(version))) {
+		if (strnstr(version, "-sc7280-", sizeof(version)) != NULL) {
+			physical = DPU_SC7280_INTF1;
+		} else if (strnstr(version, "-sm8250-", sizeof(version)) != NULL) {
+			physical = DPU_SM8250_INTF1;
+		}
 	}
 	return physical != 0 ? ml_io_map((vm_offset_t) (physical & ~0x3fffULL), 0x4000) + (vm_offset_t) (physical & 0x3fffULL) : 0;
 }
