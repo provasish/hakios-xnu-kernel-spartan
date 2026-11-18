@@ -2,7 +2,7 @@
 # HakiOS common defconfig: every setting there is, with what it does.
 # Made by tools/hakios-config.py listing common -o <this file>; the values are the ones that file sets, and tests/CI check that it names every symbol.
 #
-# 371 symbols in 18 groups; 34 are set, 25 of them drivers built in.
+# 376 symbols in 18 groups; 34 are set, 25 of them drivers built in.
 #
 
 #
@@ -165,7 +165,7 @@ CONFIG_HAKIOS_WIFI=y
 # CONFIG_XPCPROXY_IDVERSION is not set
 
 #
-# Storage and APFS (44)
+# Storage and APFS (45)
 #
 
 # the phone's storage: 1 a survey, read only; 2 the loader's block service, through which the kernel reads it (the ...
@@ -264,6 +264,9 @@ CONFIG_UFS=2
 # the file in it, by path from the volume's root
 # CONFIG_APFS_WRITE_PATH is not set
 
+# read by hakios.ufs.c (kernel)
+# CONFIG_SPARTAN_UFS_PEEK is not set
+
 # what one request through the loader costs, by size
 # CONFIG_UFS_BENCH is not set
 
@@ -301,7 +304,7 @@ CONFIG_UFS=2
 # CONFIG_VIRTIO_BLK is not set
 
 #
-# Touch and buttons (10)
+# Touch and buttons (11)
 #
 
 # the touch screen, and the power and volume buttons
@@ -319,6 +322,9 @@ CONFIG_TOUCHSCREEN=y
 # read by hakios.buttons.c (kernel)
 # CONFIG_PRESS_POWER_MS is not set
 
+# read by hakios.buttons.c (kernel)
+# CONFIG_SPARTAN_BUTTONS is not set
+
 # read by hakios.goodix.c (kernel)
 # CONFIG_TOUCH_FLIP is not set
 
@@ -335,7 +341,7 @@ CONFIG_TOUCHSCREEN=y
 # CONFIG_VIRTIO_INPUT is not set
 
 #
-# GPU and display (76)
+# GPU and display (79)
 #
 
 # rendering on Adreno (an image built with GL=1; the GPU's firmware from your phone) [needs fw-gpu/ from the phone]
@@ -398,11 +404,17 @@ CONFIG_GPU=y
 # read by MiniIOMobileFramebuffer.cpp (kernel)
 # CONFIG_FB_HZ is not set
 
+# the registers of the display interface the panel is on, for a port
+# CONFIG_FB_INTF is not set
+
 # how often the panel is really refreshed
 # CONFIG_FB_MEASURE is not set
 
 # read by MiniIOMobileFramebuffer.cpp (kernel)
 # CONFIG_FB_PRI is not set
+
+# read by MiniIOMobileFramebuffer.cpp (kernel)
+# CONFIG_FB_PROBE is not set
 
 # read by MiniIOMobileFramebuffer.cpp (kernel)
 # CONFIG_FB_QUEUE is not set
@@ -422,7 +434,7 @@ CONFIG_GPU=y
 # log the first N calls of every selector (default 3)
 # CONFIG_FBTRACE is not set
 
-# read by MiniIOMobileFramebuffer.cpp (kernel)
+# read by MiniIOMobileFramebuffer.cpp, inject_sb.c (kernel and user space)
 # CONFIG_FBWIDTH is not set
 
 # the surface's memory, as before
@@ -547,6 +559,9 @@ CONFIG_GPU=y
 
 # read by MiniIOMobileFramebuffer.cpp (kernel)
 # CONFIG_REC_STEP is not set
+
+# read by hakios.adreno.c (kernel)
+# CONFIG_SPARTAN_ADRENO_PROBE is not set
 
 # kept memory is given out as it is (to see what the clearing costs; a surface is then not all zeroes)
 # CONFIG_SURF_CLEAR is not set
