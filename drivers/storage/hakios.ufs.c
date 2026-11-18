@@ -48,6 +48,7 @@
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
 #include <miscfs/devfs/devfs.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <sys/buf.h>
 #include <sys/conf.h>
@@ -1706,12 +1707,63 @@ SYSCTL_QUAD(_kern_hakios, OID_AUTO, ufs_native_fallbacks, CTLFLAG_RD | CTLFLAG_L
 
 /* ---- bringing it up ---- */
 
+static bool
+is_spartan_platform(void)
+{
+	static const char platform[] = "spartan";
+	const void *value;
+	unsigned int size;
+	DTEntry arm_io;
+
+	return SecureDTLookupEntry(NULL, "/arm-io", &arm_io) == kSuccess &&
+	    SecureDTGetProperty(arm_io, "device_type", &value, &size) == kSuccess &&
+	    size == sizeof(platform) && memcmp(value, platform, sizeof(platform)) == 0;
+}
+
+/*
+ * First Spartan check, following the OnePlus 8 Pro controller peek.
+ * Read only the ordinary HCI registers. UIC error registers clear on read.
+ */
+static void
+spartan_ufs_peek(void)
+{
+	extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+	static const struct {
+		uint16_t offset;
+		const char *name;
+	} registers[] = {
+		{ 0x00, "CAP" }, { 0x08, "VER" }, { 0x30, "HCS" }, { 0x34, "HCE" },
+		{ 0x58, "UTRLDBR" }, { 0x60, "UTRLRSR" },
+	};
+	uint32_t enabled = 0;
+	volatile const uint32_t *regs;
+
+	if (!PE_parse_boot_argn("spartan_ufs_peek", &enabled, sizeof(enabled)) || enabled != 1) {
+		return;
+	}
+	printf("ufs: Spartan HCI peek: mapping 0x1d84000\n");
+	regs = (volatile const uint32_t *)ml_io_map(0x1d84000, 0x3000);
+	if (regs == NULL) {
+		printf("ufs: Spartan HCI peek: mapping failed\n");
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(registers) / sizeof(registers[0]); i++) {
+		printf("ufs: Spartan HCI %s = %#x\n", registers[i].name, regs[registers[i].offset / sizeof(*regs)]);
+	}
+	printf("ufs: Spartan HCI peek complete\n");
+}
+
 void
 hakios_ufs_init(void)
 {
 	uint64_t pa = 0, buffer_pa;
 	uint32_t check = 0, made = 0;
 	vm_offset_t base;
+
+	if (is_spartan_platform()) {
+		spartan_ufs_peek();
+		return;
+	}
 
 	if (!PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa)) || pa == 0) {
 		return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
