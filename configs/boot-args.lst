@@ -253,6 +253,9 @@ sound_gain	k
 sound_guard_as	k
 sound_pause	k
 sound_secs	k
+spartan_adreno_probe	k
+spartan_buttons	k
+spartan_ufs_peek	k
 speaker_probe	k
 surf_clear	k
 surf_wrap	k
