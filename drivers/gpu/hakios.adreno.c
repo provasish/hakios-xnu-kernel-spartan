@@ -95,6 +95,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <mach/vm_param.h>
+#include <pexpert/device_tree.h>
 #include <pexpert/pexpert.h>
 #include <sys/hakios.input.h>
 #include <sys/stat.h>
@@ -3748,6 +3749,44 @@ start_by_itself(void)
 	return true;
 }
 
+static bool
+is_spartan_platform(void)
+{
+	static const char platform[] = "spartan";
+	const void *value;
+	unsigned int size;
+	DTEntry arm_io;
+
+	return SecureDTLookupEntry(NULL, "/arm-io", &arm_io) == kSuccess &&
+	    SecureDTGetProperty(arm_io, "device_type", &value, &size) == kSuccess &&
+	    size == sizeof(platform) && memcmp(value, platform, sizeof(platform)) == 0;
+}
+
+/*
+ * First Spartan bring-up pass: the Kona clock gate and corrected speed-bin
+ * fuse only. The OnePlus port's later steps need board-specific validation
+ * before Spartan can change power, clocks or GPU address spaces.
+ */
+static void
+spartan_adreno_probe(void)
+{
+	uint32_t enabled = 0;
+	uint32_t bin;
+
+	if (!PE_parse_boot_argn("spartan_adreno_probe", &enabled, sizeof(enabled)) || enabled != 1) {
+		return;
+	}
+
+	step = 1;
+	announce("Spartan Adreno 650: read GCC GPU configuration AHB clock (Kona)");
+	get(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR);
+
+	step = 2;
+	announce("Spartan Adreno 650: read corrected GPU speed-bin fuse");
+	bin = get8(&qfprom, "speed bin", QFPROM_CORRECTED + 0x19b);
+	printf("adreno: Spartan Adreno 650 probe complete, speed bin %u (byte %#x)\n", (bin >> 5) & 7u, bin);
+}
+
 /*
  * Called while the system starts, before there is a root file system, and the start waits: for
  * as long as the steps and the watch after them last, nothing else writes to the log, so that
@@ -3764,6 +3803,11 @@ hakios_adreno_init(void)
 	};
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
+
+	if (is_spartan_platform()) {
+		spartan_adreno_probe();
+		return;
+	}
 
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
 		display_probe();
