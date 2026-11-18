@@ -1721,6 +1721,30 @@ is_spartan_platform(void)
 }
 
 /*
+ * The peek's lines go to the loader's log directly as well, as the buttons' and the GPU's do: without -v
+ * the kernel's own messages reach that log only through its message buffer at the end of a run, and by
+ * then a line printed this early has long been overwritten.
+ */
+extern void loader_log_putc(char c);
+
+static void spartan_say(const char *format, ...) __printflike(1, 2);
+
+static void
+spartan_say(const char *format, ...)
+{
+	char line[200];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	for (const char *c = line; *c != 0; c++) {
+		loader_log_putc(*c);
+	}
+	printf("%s", line);
+}
+
+/*
  * First Spartan check, following the OnePlus 8 Pro controller peek.
  * Read only the ordinary HCI registers. UIC error registers clear on read.
  */
@@ -1735,22 +1759,54 @@ spartan_ufs_peek(void)
 		{ 0x00, "CAP" }, { 0x08, "VER" }, { 0x30, "HCS" }, { 0x34, "HCE" },
 		{ 0x58, "UTRLDBR" }, { 0x60, "UTRLRSR" },
 	};
+	/*
+	 * The UFS block of the global clock controller (gcc 0x100000; gcc-sm8250.c): the power domain and the
+	 * controller's bus clocks. On this phone U-Boot drives UFS and removes its devices before the loader, so
+	 * they may be off; an access to the controller with them off hangs the bus (the OnePlus 8 Pro port found
+	 * them gated again after ABL as well). GCC is always clocked: read it first, and leave the controller
+	 * alone unless all three are on. Nothing is switched on here.
+	 */
+	static const struct {
+		uint32_t offset;
+		const char *name;
+		bool gdsc;
+	} gates[] = {
+		{ 0x77004, "ufs_phy_gdsc", true }, { 0x77010, "ufs_phy_axi", false }, { 0x77018, "ufs_phy_ahb", false },
+	};
 	uint32_t enabled = 0;
-	volatile const uint32_t *regs;
+	volatile const uint32_t *regs, *gcc;
+	bool usable = true;
 
 	if (!PE_parse_boot_argn("spartan_ufs_peek", &enabled, sizeof(enabled)) || enabled != 1) {
 		return;
 	}
-	printf("ufs: Spartan HCI peek: mapping 0x1d84000\n");
+	gcc = (volatile const uint32_t *)ml_io_map(0x100000 + 0x77000, 0x1000);
+	if (gcc == NULL) {
+		spartan_say("ufs: Spartan HCI peek: mapping gcc failed\n");
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(gates) / sizeof(gates[0]); i++) {
+		uint32_t v = gcc[(gates[i].offset - 0x77000) / sizeof(*gcc)];
+		/* GDSCR bit 31: PWR_ON; CBCR bit 31: CLK_OFF */
+		bool on = gates[i].gdsc ? (v & 0x80000000u) != 0 : (v & 0x80000000u) == 0;
+
+		spartan_say("ufs: Spartan gcc %s (%#x) = %#x: %s\n", gates[i].name, 0x100000 + gates[i].offset, v, on ? "on" : "OFF");
+		usable = usable && on;
+	}
+	if (!usable) {
+		spartan_say("ufs: Spartan HCI peek: the controller is not powered and clocked; not reading it\n");
+		return;
+	}
+	spartan_say("ufs: Spartan HCI peek: mapping 0x1d84000\n");
 	regs = (volatile const uint32_t *)ml_io_map(0x1d84000, 0x3000);
 	if (regs == NULL) {
-		printf("ufs: Spartan HCI peek: mapping failed\n");
+		spartan_say("ufs: Spartan HCI peek: mapping failed\n");
 		return;
 	}
 	for (unsigned i = 0; i < sizeof(registers) / sizeof(registers[0]); i++) {
-		printf("ufs: Spartan HCI %s = %#x\n", registers[i].name, regs[registers[i].offset / sizeof(*regs)]);
+		spartan_say("ufs: Spartan HCI %s = %#x\n", registers[i].name, regs[registers[i].offset / sizeof(*regs)]);
 	}
-	printf("ufs: Spartan HCI peek complete\n");
+	spartan_say("ufs: Spartan HCI peek complete\n");
 }
 
 void
