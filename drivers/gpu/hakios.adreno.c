@@ -1718,6 +1718,13 @@ zap_header(uint64_t *phys)
 	return true;
 }
 
+/*
+ * TrustZone has been handed the header in this run (step 12 or 19). Asking it to give up image 13 before it has been handed
+ * one in this boot hangs TrustZone on SM8250 (spartan, 18 November: four runs in a row stuck in the shutdown call, once forced
+ * restarts had cleared what an earlier run left); the OnePlus 8 Pro port hands the header over first, and so does step 19 here.
+ */
+static bool zap_signed;
+
 static bool
 step_zap_signature(void)
 {
@@ -1734,6 +1741,7 @@ step_zap_signature(void)
 	    header, 0, &answer);
 	if (result == 0 && answer == 0) {
 		printf("adreno: %u: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n", step);
+		zap_signed = true;
 		return true;
 	}
 	printf("adreno: %u: TrustZone does not take it: the call returns %d, its answer is %#llx\n", step, result, answer);
@@ -2699,6 +2707,15 @@ step_zap_load(void)
 		return false;
 	}
 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
+	if (!zap_signed) {
+		/* (its answer does not matter: a shader kept from before refuses it, and the request below ends that) */
+		if (!zap_header(&header)) {
+			return false;
+		}
+		scm("to take the zap shader's signature first, so that giving one up is safe", SCM_64 | SCM_SIP |
+		    SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU, header, 0, &answer);
+		zap_signed = true;
+	}
 	printf("adreno: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
 	    "TRUSTZONE DOES NOT GIVE IT UP: the next answers tell whether it keeps one");
 	segment = image_file("fw", FW("zap.b02"), &size);
