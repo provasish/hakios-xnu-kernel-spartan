@@ -99,6 +99,7 @@ fb_intf	k
 fb_measure	k
 fb_pri	k
 fb_probe	k
+fb_push	k
 fb_queue	k
 fb_threads	k
 fbheight	k

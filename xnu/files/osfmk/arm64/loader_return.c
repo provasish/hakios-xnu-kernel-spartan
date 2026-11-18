@@ -45,6 +45,7 @@ extern void gic_v3_irq_cpu_shutdown(void);
 void loader_log_putc(char c);
 void loader_return(void);
 extern void hakios_adreno_quiesce(void);
+extern void hakios_display_quiesce(void);  /* iokit/Kernel/MiniIOMobileFramebuffer.cpp: the panel's autorefresh again (fb_push) */
 extern void hakios_adreno_stop(void);
 extern void hakios_adreno_minute(void);
 extern void hakios_wifi_stop(void);
@@ -372,6 +373,7 @@ loader_return(void)
 	psci_smp_stop_others();
 #endif
 	hakios_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
+	hakios_display_quiesce();      /* the panel refreshing from the boot framebuffer again (fb_push), for the loader's text */
 	hakios_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
 	hakios_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	hakios_adsp_quiesce();         /* nor the audio DSP */

@@ -740,6 +740,155 @@ probeDisplay(void)
 	displayLog("display: --- end of the display engine as the firmware left it ---\n");
 }
 
+/*
+ * spartan's command-mode presentation (boot-arg fb_push=1; 0, the default for now: the firmware's autorefresh).
+ * ABL leaves CTL0 -> VIG0 -> LM0 -> PP0 -> DSC0 -> INTF1 in command mode, INTF1's tear check on and autorefresh
+ * fetching the boot framebuffer on every TE (fb_probe=1 shows it), so a frame copied into that memory reaches
+ * the panel half written: the shaking. Instead autorefresh goes off and each frame is pushed once, after it has
+ * been written whole (CTL0 flush + start); the tear check holds the transfer to the panel's TE, and PINGPONG_0's
+ * done bit (polled) says when the memory may be written again. The panel shows its own RAM in between. After the
+ * OnePlus 8 Pro port's (dekefake/hackios-op8pro, pushStart/pushWait/pushFrame/pushStop), with this panel's one
+ * pipe (no VIG1) and one buffer. Offsets: MDSS-relative, as probeDisplay()'s.
+ */
+#define MDP_INTR_STATUS         0x1014
+#define MDP_INTR_CLEAR          0x1018
+#define MDP_INTR_PP0_DONE       (1u << 8)
+#define CTL0_TOP                0x2014
+#define CTL0_FLUSH              0x2018
+#define CTL0_START              0x201c
+#define CTL0_INTF_ACTIVE        0x20f4
+#define CTL_TOP_CMD_MODE        (1u << 17)
+#define CTL_FLUSH_FRAME         (1u << 0 | 1u << 17)    /* VIG0 and the CTL itself */
+#define VIG0_SRC0_ADDR          0x5014
+#define INTF1_TE_EN             0x6ba84
+#define INTF1_TE_VSYNC          0x6ba88
+#define INTF1_TE_EXTERNAL       (1u << 20)
+#define INTF1_TE_LINE           0x6bab0
+#define INTF1_AUTOREFRESH       0x6bab4
+#define PUSH_TIMEOUT_MS         100                     /* twelve refreshes at 120: the panel or the MDP has stopped */
+#define PUSH_FAILURES           3                       /* pushes in a row that did not finish: autorefresh back */
+
+static TUNABLE(uint32_t, gPush, "fb_push", 0);
+static uint32_t gAutorefresh;           /* the firmware's setting, back for the loader (hakios_display_quiesce()) */
+static bool gPushing;                   /* autorefresh off: frames are pushed */
+static uint64_t gPushed;                /* when the last push was started; 0: none in flight */
+static uint32_t gPushFailures, gPushes, gPushWaitsLong;
+
+static void
+displayWrite(unsigned offset, uint32_t value)
+{
+	*(volatile uint32_t *)(gDPU + offset) = value;
+}
+
+/* The panel refreshing from the boot framebuffer on its own again (to give the display back, or after a failure). */
+static void
+pushStop(void)
+{
+	displayWrite(INTF1_AUTOREFRESH, gAutorefresh);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gPushing = false;
+	gPushed = 0;
+}
+
+/* Autorefresh off, once its frame in flight is out: from now on the panel gets a frame only when one is pushed. */
+static bool
+pushStart(unsigned height)
+{
+	if (gPush != 1 || !spartanDisplay() || !mapDisplay()) {
+		return false;
+	}
+	uint32_t top = displayReg(gDPU, CTL0_TOP), intf = displayReg(gDPU, CTL0_INTF_ACTIVE);
+	uint32_t vig0 = displayReg(gDPU, VIG0_SRC0_ADDR), te = displayReg(gDPU, INTF1_TE_EN);
+
+	gAutorefresh = displayReg(gDPU, INTF1_AUTOREFRESH);
+	if (!(top & CTL_TOP_CMD_MODE) || intf != 0x2 || vig0 != vinfo.v_physaddr || !(te & 1) || !(gAutorefresh & (1u << 31))) {
+		displayLog("display: not the command-mode pipeline expected (CTL0 top %#x intf %#x, VIG0 %#x, TE %#x, autorefresh %#x); "
+		    "frames go on being copied under autorefresh\n", top, intf, vig0, te, gAutorefresh);
+		return false;
+	}
+	uint32_t vsync = displayReg(gDPU, INTF1_TE_VSYNC);
+	unsigned waited;
+
+	displayWrite(INTF1_TE_VSYNC, vsync & ~INTF1_TE_EXTERNAL);
+	displayWrite(INTF1_AUTOREFRESH, gAutorefresh & ~(1u << 31));
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (waited = 0; waited < PUSH_TIMEOUT_MS * 10; waited++) {
+		uint32_t line = displayReg(gDPU, INTF1_TE_LINE) & 0xffff;
+
+		if (line == 0 || line >= height) {
+			break;
+		}
+		IODelay(100);
+	}
+	displayWrite(INTF1_TE_VSYNC, vsync);
+	if (waited == PUSH_TIMEOUT_MS * 10) {
+		displayLog("display: the autorefresh frame did not finish; autorefresh back on\n");
+		displayWrite(INTF1_AUTOREFRESH, gAutorefresh);
+		return false;
+	}
+	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+	gPushing = true;
+	displayLog("display: autorefresh %#x off after %u us; each frame is pushed through CTL0 on the panel's TE (polled)\n",
+	    gAutorefresh, waited * 100);
+	return true;
+}
+
+/* Until no push is in flight: the framebuffer is the MDP's while one is. false: it did not finish. */
+static bool
+pushWait(void)
+{
+	uint64_t pushed = gPushed, deadline, waiting = mach_absolute_time();
+
+	if (pushed == 0) {
+		return true;
+	}
+	clock_interval_to_deadline(PUSH_TIMEOUT_MS, kMillisecondScale, &deadline);
+	while (!(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE)) {
+		if (mach_absolute_time() >= deadline) {
+			gPushed = 0;
+			return false;
+		}
+		IODelay(200);
+	}
+	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+	uint64_t ns;
+
+	/* (how long this waited, not how long ago the push was: a pause in the drawing is no slow push) */
+	absolutetime_to_nanoseconds(mach_absolute_time() - waiting, &ns);
+	gPushWaitsLong += ns > 20 * NSEC_PER_MSEC;
+	gPushed = 0;
+	gPushFailures = 0;
+	return true;
+}
+
+/* The frame in the framebuffer to the panel. Every processor that wrote it has drained its stores (helperMain()). */
+static void
+pushFrame(void)
+{
+	__asm__ volatile ("dsb sy" ::: "memory");
+	gPushed = mach_absolute_time();
+	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+	displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME);
+	displayWrite(CTL0_START, 1);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if (++gPushes == 1 || gPushes % 600 == 0) {
+		displayLog("display: %u frames pushed, %u waits over 20 ms\n", gPushes, gPushWaitsLong);
+	}
+}
+
+/* Back to the loader (loader_return.c), from any context: the panel refreshing from the boot framebuffer again. */
+extern "C" void
+hakios_display_quiesce(void)
+{
+	if (!gPushing) {
+		return;
+	}
+	for (unsigned i = 0; i < PUSH_TIMEOUT_MS * 10 && gPushed != 0 && !(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE); i++) {
+		IODelay(100);
+	}
+	pushStop();
+}
+
 bool
 IOMobileFramebuffer::start(IOService * provider)
 {
@@ -1112,6 +1261,8 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 
 			fb->drawRows(job, y0, y1, blend);
 			fb->beamShareDone(job, index + 1, y0, y1, began);
+			/* (this processor's write-combined stores out to memory before the share is said done: fb_push sends what memory holds) */
+			__asm__ volatile ("dsb sy" ::: "memory");
 		}
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
@@ -1621,8 +1772,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	}
 	fStatWaiting += mach_absolute_time() - began;
 	began = ready = mach_absolute_time();
-	fBeamScan = fBeamIntf != 0 ? beamNextScan(began) : 0;
-	if (fBeamIntf != 0) {
+	{
+		static bool tried;
+
+		if (!tried) {
+			tried = true;
+			pushStart(fPanelHeight);
+		}
+	}
+	fBeamScan = fBeamIntf != 0 && !gPushing ? beamNextScan(began) : 0;
+	if (gPushing) {
+		/* paced by the panel: the frame before has to be out of the framebuffer first */
+		if (!pushWait() && ++gPushFailures >= PUSH_FAILURES) {
+			displayLog("display: %u pushed frames in a row did not finish in %u ms; autorefresh back on\n", PUSH_FAILURES,
+			    PUSH_TIMEOUT_MS);
+			pushStop();
+		}
+		fStatOnBeat++;
+		fStatBeatWait += mach_absolute_time() - began;
+		began = mach_absolute_time();
+	} else if (fBeamIntf != 0) {
 		/* (on the panel when that scan reads it: that is the beat now, kept by the panel) */
 		fStatOnBeat++;
 	} else if (gOnTheBeat) {
@@ -1722,6 +1891,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				gShownSurface = sid;
 			}
 		}
+	}
+	if (gPushing) {
+		pushFrame();
 	}
 	drawn = mach_absolute_time();
 	if (recorded != NULL) {
