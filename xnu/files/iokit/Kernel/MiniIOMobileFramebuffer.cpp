@@ -492,6 +492,180 @@ IOMobileFramebuffer::publishModes(void)
 	OSSafeReleaseNULL(color);
 }
 
+/*
+ * SM8250's display engine as the firmware leaves it (spartan, fb_probe=1): what drives the panel, read only, for
+ * the push path to come. Offsets: Linux dpu_6_0_sm8250 and the phone's live tree, as the OnePlus 8 Pro port has
+ * them (dekefake/hackios-op8pro, MiniIOMobileFramebuffer.cpp probeDisplay()); the MDP's registers start at
+ * MDSS (0xae00000) + 0x1000. The one write: the MDSS register clock (disp_cc_mdss_ahb) switched on, and only
+ * where the firmware left the display powered. Never the apps SMMU's context banks or page tables: reading
+ * those sends an SM8250 to CrashDump (the OnePlus port's finding); its global registers only.
+ */
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" void loader_log_line(const char *line);
+extern "C" {
+#include <pexpert/device_tree.h>
+}
+static vm_offset_t gDPU;
+
+static uint32_t
+displayReg(vm_offset_t base, unsigned offset)
+{
+	return *(volatile uint32_t *)(base + offset);
+}
+
+/* To the loader's log directly: the kernel's own ring is overwritten by iOS long before the run ends. */
+static void
+displayLog(const char * format, ...)
+{
+	char line[512];
+	va_list list;
+
+	va_start(list, format);
+	vsnprintf(line, sizeof(line), format, list);
+	va_end(list);
+	loader_log_line(line);
+}
+
+static bool
+spartanDisplay(void)
+{
+	static const char platform[] = "spartan";
+	const void *value;
+	unsigned int size;
+	DTEntry arm_io;
+
+	return SecureDTLookupEntry(NULL, "/arm-io", &arm_io) == kSuccess &&
+	       SecureDTGetProperty(arm_io, "device_type", &value, &size) == kSuccess &&
+	       size == sizeof(platform) && memcmp(value, platform, sizeof(platform)) == 0;
+}
+
+/* The MDSS registers (gDPU), once: only on a display the firmware left powered, with its register clock on. */
+static bool
+mapDisplay(void)
+{
+	if (gDPU != 0) {
+		return true;
+	}
+	vm_offset_t gcc = ml_io_map(0x00100000, 0x10000);
+	uint32_t bus = displayReg(gcc, 0xb00c);         /* gcc_disp_ahb_clk */
+
+	if (!(bus & 1)) {
+		displayLog("display: GCC_DISP_AHB_CLK %#x disabled\n", bus);
+		return false;
+	}
+	vm_offset_t cc = ml_io_map(0x0af00000, 0x4000);         /* dispcc */
+	uint32_t power = displayReg(cc, 0x3000), ahb = displayReg(cc, 0x2080);
+
+	displayLog("display: SM8250 GCC_DISP_AHB %#x GDSCR %#x MDSS_AHB %#x\n", bus, power, ahb);
+	if (!(power & (1u << 31))) {
+		displayLog("display: MDSS power off\n");
+		return false;
+	}
+	/* Enable only the register-access clock; never power up an inactive display. */
+	*(volatile uint32_t *)(cc + 0x2080) = ahb | 1;
+	__asm__ volatile ("dsb osh" ::: "memory");
+	unsigned retry;
+	for (retry = 0; retry < 1000 && (displayReg(cc, 0x2080) & (1u << 31)); retry++) {
+		IODelay(1);
+	}
+	if (retry == 1000) {
+		displayLog("display: MDSS register clock did not start\n");
+		return false;
+	}
+	gDPU = ml_io_map(0x0ae00000, 0x90000);
+	return gDPU != 0;
+}
+
+static void
+probeDisplay(void)
+{
+	uint32_t probe = 0;
+
+	PE_parse_boot_argn("fb_probe", &probe, sizeof(probe));
+	if (!probe || !spartanDisplay() || !mapDisplay()) {
+		return;
+	}
+	displayLog("display: boot framebuffer pa %#llx %ux%u rowbytes %u\n", (unsigned long long)vinfo.v_physaddr, vinfo.v_width,
+	    vinfo.v_height, vinfo.v_rowbytes);
+	/* MDP top (MDSS + 0x1000): INTF_SEL, INTR_EN/STATUS, INTR2_EN/STATUS, VSYNC_SEL */
+	displayLog("display: HW %#x mdss-intr %#x INTF_SEL %#x INTR en %#x st %#x INTR2 en %#x st %#x VSYNC_SEL %#x\n",
+	    displayReg(gDPU, 0), displayReg(gDPU, 0x10), displayReg(gDPU, 0x1004), displayReg(gDPU, 0x1010),
+	    displayReg(gDPU, 0x1014), displayReg(gDPU, 0x1008), displayReg(gDPU, 0x100c), displayReg(gDPU, 0x1414));
+	for (unsigned i = 0; i < 6; i++) {
+		unsigned c = 0x2000 + i * 0x200;
+
+		displayLog("display: CTL%u top %#x flush %#x start %#x prep %#x intf %#x dsc %#x m3d %#x fetch %#x intf-flush %#x "
+		    "layers %#x %#x %#x %#x %#x %#x ext %#x %#x\n", i,
+		    displayReg(gDPU, c + 0x14), displayReg(gDPU, c + 0x18), displayReg(gDPU, c + 0x1c), displayReg(gDPU, c + 0xd0),
+		    displayReg(gDPU, c + 0xf4), displayReg(gDPU, c + 0xe8), displayReg(gDPU, c + 0xe4), displayReg(gDPU, c + 0xfc),
+		    displayReg(gDPU, c + 0x110), displayReg(gDPU, c), displayReg(gDPU, c + 4), displayReg(gDPU, c + 8),
+		    displayReg(gDPU, c + 12), displayReg(gDPU, c + 16), displayReg(gDPU, c + 0x24), displayReg(gDPU, c + 0x40),
+		    displayReg(gDPU, c + 0x44));
+	}
+	static const unsigned pipes[] = { 0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000 };
+	for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
+		unsigned p = pipes[i];
+
+		displayLog("display: SSPP@%#x size %#x img %#x xy %#x out %#x oxy %#x addr %#x %#x stride %#x fmt %#x unpack %#x op %#x "
+		    "fetch %#x sw-status %#x\n", p,
+		    displayReg(gDPU, p), displayReg(gDPU, p + 4), displayReg(gDPU, p + 8), displayReg(gDPU, p + 0xc),
+		    displayReg(gDPU, p + 0x10), displayReg(gDPU, p + 0x14), displayReg(gDPU, p + 0x18), displayReg(gDPU, p + 0x24),
+		    displayReg(gDPU, p + 0x30), displayReg(gDPU, p + 0x34), displayReg(gDPU, p + 0x38), displayReg(gDPU, p + 0x48),
+		    displayReg(gDPU, p + 0x70));
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		unsigned l = 0x45000 + i * 0x1000, p = 0x71000 + i * 0x800;
+
+		displayLog("display: LM%u op %#x out %#x border %#x; PP%u te %#x dsc %#x autorefresh %#x line %#x\n", i,
+		    displayReg(gDPU, l), displayReg(gDPU, l + 4), displayReg(gDPU, l + 8), i, displayReg(gDPU, p),
+		    displayReg(gDPU, p + 0xa0), displayReg(gDPU, p + 0x30), displayReg(gDPU, p + 0x2c));
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned d = 0x81000 + i * 0x400;
+
+		displayLog("display: DSC%u common %#x enc %#x size %#x\n", i, displayReg(gDPU, d), displayReg(gDPU, d + 4),
+		    displayReg(gDPU, d + 0x14));
+	}
+	for (unsigned i = 1; i <= 2; i++) {
+		unsigned p = 0x6b000 + i * 0x800, t = 0x6e700 + i * 0x100;
+
+		displayLog("display: INTF%u engine %#x config %#x config2 %#x cmd-trigger %#x mux %#x status %#x intr en %#x st %#x "
+		    "tear-intr en %#x st %#x\n", i,
+		    displayReg(gDPU, p), displayReg(gDPU, p + 4), displayReg(gDPU, p + 0x60), displayReg(gDPU, p + 0x84),
+		    displayReg(gDPU, p + 0x25c), displayReg(gDPU, p + 0x26c), displayReg(gDPU, p + 0x1c0),
+		    displayReg(gDPU, p + 0x1c4), displayReg(gDPU, t), displayReg(gDPU, t + 4));
+		displayLog("display: INTF%u TE vsync-sel %#x en %#x vsync %#x height %#x wrcount %#x init %#x thresh %#x start %#x "
+		    "rd-irq %#x wr-irq %#x out %#x line %#x autorefresh %#x frame %u\n", i,
+		    displayReg(gDPU, p + 0x280), displayReg(gDPU, p + 0x284), displayReg(gDPU, p + 0x288), displayReg(gDPU, p + 0x28c),
+		    displayReg(gDPU, p + 0x290), displayReg(gDPU, p + 0x294), displayReg(gDPU, p + 0x29c), displayReg(gDPU, p + 0x2a0),
+		    displayReg(gDPU, p + 0x2a4), displayReg(gDPU, p + 0x2a8), displayReg(gDPU, p + 0x2ac), displayReg(gDPU, p + 0x2b0),
+		    displayReg(gDPU, p + 0x2b4), displayReg(gDPU, p + 0xac));
+	}
+	/* Is anything still moving on its own? Sample the INTF1 counters over 100 ms. */
+	for (unsigned i = 0; i < 5; i++) {
+		displayLog("display: t+%ums INTF1 frame %u line %u te-out %#x te-line %#x intr-st %#x tear-st %#x top-st %#x\n", i * 25,
+		    displayReg(gDPU, 0x6b8ac), displayReg(gDPU, 0x6b8b0), displayReg(gDPU, 0x6baac), displayReg(gDPU, 0x6bab0),
+		    displayReg(gDPU, 0x6b9c4), displayReg(gDPU, 0x6e804), displayReg(gDPU, 0x1014));
+		IODelay(25000);
+	}
+	/* Which address space the MDP fetches in: the apps SMMU's stream matches. Global registers only. */
+	vm_offset_t smmu = ml_io_map(0x15000000, 0x2000);
+	uint32_t scr0 = displayReg(smmu, 0), matches = displayReg(smmu, 0x20) & 0xff, wide = scr0 & (1u << 3);
+	displayLog("display: apps SMMU scr0 %#x, %u stream matches\n", scr0, matches);
+	for (uint32_t n = 0; n < matches && n < 256; n++) {
+		uint32_t smr = displayReg(smmu, 0x800 + 4 * n), s2cr = displayReg(smmu, 0xc00 + 4 * n);
+		uint32_t id = smr & (wide ? 0xffff : 0x7fff), mask = (smr >> 16) & (wide ? 0xffff : 0x7fff);
+		bool valid = wide ? (s2cr & (1u << 10)) : (smr >> 31);
+
+		/* the MDP's streams on SM8250: 0x820, 0x821 (dt: mdss_mdp iommus 0x820 0x402) */
+		if (valid && ((id & ~mask) == (0x820 & ~mask))) {
+			displayLog("display: apps SMMU match %u: stream %#x mask %#x -> s2cr %#x (context %u)\n", n, id, mask, s2cr,
+			    s2cr & 0xff);
+		}
+	}
+	displayLog("display: --- end of the display engine as the firmware left it ---\n");
+}
+
 bool
 IOMobileFramebuffer::start(IOService * provider)
 {
@@ -505,6 +679,7 @@ IOMobileFramebuffer::start(IOService * provider)
 		    vinfo.v_depth);
 		return false;
 	}
+	probeDisplay();
 	if (gMeasure && kernel_thread_start(measurePanel, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
