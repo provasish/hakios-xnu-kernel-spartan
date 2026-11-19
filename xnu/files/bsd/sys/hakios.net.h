@@ -57,6 +57,8 @@ void hakios_net_input_unit(unsigned unit, const uint8_t *frame, size_t length);
 /* Frames can pass now / can no longer pass (on en0 / on en<unit>). */
 void hakios_net_link_state(bool up);
 void hakios_net_link_state_unit(unsigned unit, bool up);
+/* en0's link-layer address from now on (the radio's own, or a private one for a network) */
+void hakios_net_address(const uint8_t address[6]);
 
 void hakios_net_init(void);            /* the links there are: each looks for its hardware (or its boot-arg) */
 /* an Apple80211 request (SIOCGA80211, SIOCSA80211) for the interface of a radio: hakios.apple80211.c */

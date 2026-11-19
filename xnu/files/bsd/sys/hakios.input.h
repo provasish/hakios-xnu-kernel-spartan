@@ -101,6 +101,9 @@ const uint8_t *hakios_wifi_driver_file(const char *name, uint64_t *size);     /*
 bool hakios_wifi_radio_map(uint64_t physical, uint64_t size, unsigned long long *address); /* memory shown to the radio */
 bool hakios_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *first_spi); /* where the radio raises its interrupts */
 bool hakios_wifi_radio_address(uint8_t *address);      /* the radio's own address (boot-arg wifi_mac), if one was given */
+/* On PCI (sys/hakios.pcie_wifi.h) QRTR rides the radio's MHI channel: a datagram from it, and the function that sends one (NULL: gone) */
+void hakios_wifi_qrtr_input(const void *data, unsigned long length);
+void hakios_wifi_qrtr_carrier(int (*send)(const void *data, unsigned long length));
 /* the network to join (fw/network of the small image): name and passphrase, buffer sizes in and lengths out */
 bool hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length);
 

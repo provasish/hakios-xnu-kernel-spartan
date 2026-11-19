@@ -307,6 +307,21 @@ hakios_net_link_state(bool up)
 	hakios_net_link_state_unit(0, up);
 }
 
+/* en0's link-layer address from now on: the radio's own, or a private one for the network joined (iOS's private Wi-Fi address) */
+void
+hakios_net_address(const uint8_t address[6])
+{
+	struct net_if *n = net_if_unit(0);
+	uint8_t now[ETHER_ADDR_LEN];
+
+	if (n == NULL || (ifnet_lladdr_copy_bytes(n->ifp, now, sizeof(now)) == 0 && memcmp(now, address, sizeof(now)) == 0)) {
+		return;
+	}
+	/* (configd hears of it: the link layer posts KEV_DL_LINK_ADDRESS_CHANGED) */
+	ifnet_set_lladdr(n->ifp, address, ETHER_ADDR_LEN);
+	printf("net: en0's address is %s now\n", address[0] & 2 ? "a private one, for the network" : "the radio's own");
+}
+
 /* The interface's own thread: for a link that wants to be asked, and for the minute's line in the log. */
 static void
 net_thread(void *parameter, __unused wait_result_t result)

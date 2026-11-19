@@ -6,7 +6,9 @@
 #define _LX_MORE_H_
 
 #include <linux/types.h>
+#include <linux/delay.h>
 #include <linux/interrupt.h>
+#include <linux/pm.h>
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
 #include <linux/ieee80211.h>
@@ -18,6 +20,16 @@
 #define IRQ_DISABLE_UNLAZY	(1 << 19)	/* disable_irq() masks at once: it always does here */
 int enable_irq_wake(unsigned int irq);
 int disable_irq_wake(unsigned int irq);
+/* which processor takes an interrupt is the kernel's choice here (all go to the one thread of hakios.lx.c) */
+static inline int irq_set_affinity_and_hint(unsigned int irq, const cpumask_t *mask) { return (0); }
+
+/* (no CONFIG_PM_SLEEP: the system's sleep reaches the driver through lx_suspend()/lx_resume(), not its PM ops) */
+#ifndef SET_SYSTEM_SLEEP_PM_OPS
+#define SET_SYSTEM_SLEEP_PM_OPS(suspend_function, resume_function)
+#endif
+#ifndef SET_LATE_SYSTEM_SLEEP_PM_OPS
+#define SET_LATE_SYSTEM_SLEEP_PM_OPS(suspend_function, resume_function)
+#endif
 
 /* the phone is not woken by its radio: nothing here suspends */
 static inline bool device_may_wakeup(struct device *dev) { return (false); }

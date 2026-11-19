@@ -1,9 +1,9 @@
 /*
- * Darwin-on-hakios: the station boundary.
+ * Darwin-on-redwood: the station boundary.
  *
  * On one side whatever does the scanning and the joining with a radio: the station logic over
  * ath11k on the phone (wifi/lx in the repository). On the other whoever wants a network: the
- * Apple80211 requests of Darwin's Wi-Fi side, answered in drivers/wifi/hakios.apple80211.c, and the
+ * Apple80211 requests of iOS's Wi-Fi side, answered in drivers/wifi/hakios.apple80211.c, and the
  * kernel's own join of the network it was given in a file (drivers/wifi/hakios.wifi.c). Frames do
  * not pass here, and neither does "the link is up": those go through bsd/sys/hakios.net.h,
  * which the station side calls itself.
@@ -42,12 +42,14 @@ struct hakios_sta_scan {
 	uint16_t dwell_ms;                      /* on each channel; 0: the radio's own */
 };
 
-enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK };
+enum { HAKIOS_STA_OPEN, HAKIOS_STA_WPA2_PSK };     /* WPA2_PSK: a passphrase (or its key) -- WPA3's SAE too, which takes the passphrase */
 
 struct hakios_sta_join {
 	uint8_t ssid[32], ssid_length;
 	uint8_t bssid[6];                       /* all zero: the access point of that name heard best */
 	int security;
+	int akm;                                /* the key management asked for (00-0f-ac-n: 2 PSK, 6 PSK-SHA256, 8 SAE); 0: the station's choice */
+	uint8_t address[6];                     /* ours for this network (iOS's private Wi-Fi address); all zero: the radio's own */
 	uint8_t pmk[32];                        /* WPA2 with a passphrase: the key made of the passphrase and the name ... */
 	uint8_t passphrase[64], passphrase_length;      /* ... or, if this is not empty, the passphrase itself */
 };
@@ -113,6 +115,13 @@ bool     hakios_sta_heard(unsigned index, struct hakios_sta_bss *bss);
 void     hakios_sta_state(struct hakios_sta_state *state);
 unsigned hakios_sta_channels(struct hakios_sta_channel *channels, unsigned most);
 bool     hakios_sta_address(uint8_t *address);
+/*
+ * The system's sleep (drivers/wifi/hakios.wifi.c): the station's calls held, the network left and the radio stopped -- iOS
+ * is told the link is down, not that the radio is off; true if it was on. And after it: the calls go on, the radio
+ * is on again if it was, and the standing network is joined again.
+ */
+bool     hakios_sta_suspend(void);
+void     hakios_sta_resume(bool was_on);
 
 /* ---- the listener: drivers/wifi/hakios.apple80211.c ---- */
 void     hakios_apple80211_event(enum hakios_sta_event event, int status);

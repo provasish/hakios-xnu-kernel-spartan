@@ -27,6 +27,7 @@
 #include <sys/hakios.input.h>
 #include <sys/hakios.lx.h>
 #include <sys/hakios.net.h>
+#include <sys/hakios.pcie_wifi.h>
 #include <sys/systm.h>
 #include <vm/memory_types.h>
 #include <vm/vm_kern.h>
@@ -231,6 +232,78 @@ lx_os_rproc_boot(void)
 	return hakios_wifi_dsp_is_up() ? 0 : ENXIO;
 }
 
+/* ---- the radio's bus -------------------------------------------------------------------------------- */
+
+/*
+ * A QCA6390 on PCIe where the device has a driver for it (sys/hakios.pcie_wifi.h: spartan's); otherwise redwood's
+ * WCN6750, inside the SoC.
+ */
+unsigned
+lx_os_bus(void)
+{
+#ifdef HAKIOS_SPARTAN_WIFI
+	return LX_BUS_PCI;
+#else
+	return LX_BUS_AHB;
+#endif
+}
+
+unsigned
+lx_os_pci_config_read(unsigned offset, unsigned width)
+{
+#ifdef HAKIOS_SPARTAN_WIFI
+	return hakios_pcie_wifi_config_read(offset, width);
+#else
+	(void)offset;
+	(void)width;
+	return ~0u;
+#endif
+}
+
+void
+lx_os_pci_config_write(unsigned offset, unsigned value, unsigned width)
+{
+#ifdef HAKIOS_SPARTAN_WIFI
+	hakios_pcie_wifi_config_write(offset, value, width);
+#else
+	(void)offset;
+	(void)value;
+	(void)width;
+#endif
+}
+
+int
+lx_os_pci_bar(unsigned bar, unsigned long long *physical, unsigned long *size)
+{
+#ifdef HAKIOS_SPARTAN_WIFI
+	uint64_t at = 0, length = 0;
+
+	if (!hakios_pcie_wifi_bar(bar, &at, &length)) {
+		return 0;
+	}
+	*physical = at;
+	*size = (unsigned long)length;
+	return 1;
+#else
+	(void)bar;
+	(void)physical;
+	(void)size;
+	return 0;
+#endif
+}
+
+void
+lx_os_qrtr_input(const void *data, unsigned long length)
+{
+	hakios_wifi_qrtr_input(data, length);
+}
+
+void
+lx_os_qrtr_attach(int (*send)(const void *data, unsigned long length))
+{
+	hakios_wifi_qrtr_carrier(send);
+}
+
 int
 lx_os_radio_address(unsigned char *address)
 {
@@ -352,6 +425,14 @@ lx_os_net_link(int up)
 {
 	if (lx_link_attached) {
 		hakios_net_link_state(up != 0);
+	}
+}
+
+void
+lx_os_net_address(const unsigned char address[6])
+{
+	if (lx_link_attached) {
+		hakios_net_address(address);
 	}
 }
 

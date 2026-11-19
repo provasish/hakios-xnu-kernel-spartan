@@ -488,6 +488,18 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
+# ... or, for a QCA6390 on PCIe (spartan: drivers/wifi/hakios.wifi.c's pci_init()), linux-firmware's ath11k/QCA6390/hw2.0
+# amss.bin and m3.bin (the build for hosts that run ath11k; 3.6 MB) in ../fw-wifi, and the phone's board data and
+# regulatory database in ../fw-wifi/qca6390 (its persist partition's bdwlan.elf, its firmware partition's regdb.bin)
+if [ -f ../fw-wifi/amss.bin ] && [ ! -f ../fw-wifi/wpss.mdt ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-wifi/amss.bin ../fw-wifi/m3.bin root/fw/
+	for f in bdwlan.elf regdb.bin; do
+		[ -f ../fw-wifi/qca6390/$f ] && install -m 0644 ../fw-wifi/qca6390/$f root/fw/
+	done
+	rm -f root/fw/network
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
+fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (drivers/haptic/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
