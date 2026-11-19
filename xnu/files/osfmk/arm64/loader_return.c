@@ -597,3 +597,109 @@ hv_wdt_pet_init(void)
 	hv_wdt_pet(NULL, NULL);
 }
 STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hv_wdt_pet_init);
+
+/*
+ * Who uses the processors (with boot-arg cpuload: called every few seconds by hakios.cpufreq.c's load thread). For
+ * every thread, the time it ran since the last call, from its recount totals; the busiest ones go to the loader's
+ * log, with their process and their own name:
+ *   tl: top 5000 ms, 580 threads, 2400 ms of processor time in all
+ *   tl: top 1: backboardd/render 812 ms     (in those 5000 ms; one core's whole second is 1000)
+ * Idle threads are left out.
+ * Here, and not in the driver, because the global list of threads and their times are the Mach side's.
+ */
+#include <kern/thread.h>
+#include <kern/task.h>
+#include <kern/processor.h>
+#include <kern/recount.h>
+#include <kern/queue.h>
+
+extern void hakios_tl(const char *format, ...) __printflike(1, 2);
+extern char *proc_name_address(void *p);
+void hakios_cputop(uint64_t interval_ms);
+
+#define TOP_SLOTS       4096    /* threads remembered (a power of two) */
+#define TOP_SHOWN       10
+
+struct top_slot {
+	uint64_t tid, time;
+};
+static struct top_slot top_table[2][TOP_SLOTS];
+static unsigned top_now;
+
+static struct top_slot *
+top_find(struct top_slot *table, uint64_t tid, bool insert)
+{
+	for (unsigned i = 0, at = (unsigned)(tid * 0x9e3779b97f4a7c15ULL >> 52) & (TOP_SLOTS - 1); i < TOP_SLOTS;
+	    i++, at = (at + 1) & (TOP_SLOTS - 1)) {
+		if (table[at].tid == tid) {
+			return &table[at];
+		}
+		if (table[at].tid == 0) {
+			return insert ? &table[at] : NULL;
+		}
+	}
+	return NULL;
+}
+
+void
+hakios_cputop(uint64_t interval_ms)
+{
+	struct {
+		uint64_t delta;
+		char name[48];
+	} best[TOP_SHOWN];
+	struct top_slot *now = top_table[top_now ^ 1], *before = top_table[top_now];
+	unsigned shown = 0, threads_seen = 0;
+	uint64_t all = 0;
+	thread_t th;
+	bzero(best, sizeof(best));
+	bzero(now, sizeof(top_table[0]));
+	lck_mtx_lock(&tasks_threads_lock);
+	queue_iterate(&threads, th, thread_t, threads) {
+		uint64_t tid = thread_tid(th), time = recount_thread_time_mach(th), delta = 0, ns;
+		struct top_slot *slot = top_find(now, tid, true), *old = top_find(before, tid, false);
+
+		threads_seen++;
+		if ((th->state & TH_IDLE) || (th->bound_processor != PROCESSOR_NULL && th->bound_processor->idle_thread == th)) {
+			continue;               /* a processor's idle thread: "running" whenever the processor is not */
+		}
+		if (slot != NULL) {
+			slot->tid = tid;
+			slot->time = time;
+		}
+		if (old != NULL && time > old->time) {
+			delta = time - old->time;
+		}
+		absolutetime_to_nanoseconds(delta, &ns);
+		delta = ns / 1000000;                   /* ms */
+		all += delta;
+		if (delta == 0 || (shown == TOP_SHOWN && delta <= best[TOP_SHOWN - 1].delta)) {
+			continue;
+		}
+		unsigned i = shown < TOP_SHOWN ? shown++ : TOP_SHOWN - 1;
+		for (; i > 0 && best[i - 1].delta < delta; i--) {
+			best[i] = best[i - 1];
+		}
+		task_t task = get_threadtask(th);
+		void *proc = task != TASK_NULL ? get_bsdtask_info(task) : NULL;
+		char thread_name[MAXTHREADNAMESIZE] = "";
+		const char *process = proc != NULL ? proc_name_address(proc) : "kernel";
+
+		thread_get_thread_name(th, thread_name);
+		best[i].delta = delta;
+		snprintf(best[i].name, sizeof(best[i].name), "%s/%s", process != NULL ? process : "?",
+		    thread_name[0] != 0 ? thread_name : "-");
+		for (char *c = best[i].name; *c != 0; c++) {
+			if (*c == ' ') {
+				*c = '_';
+			}
+		}
+	}
+	lck_mtx_unlock(&tasks_threads_lock);
+	top_now ^= 1;
+	/* (a line each: hakios_tl() takes 192 characters) */
+	hakios_tl("tl: top %llu ms, %u threads, %llu ms of processor time in all\n", interval_ms, threads_seen, all);
+	for (unsigned i = 0; i < shown; i++) {
+		hakios_tl("tl: top %u: %s %llu ms\n", i + 1, best[i].name, best[i].delta);
+	}
+}

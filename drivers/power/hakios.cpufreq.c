@@ -28,6 +28,7 @@ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
 extern void hakios_tl(const char *format, ...) __printflike(1, 2);
 extern bool ml_cpu_idle_time(int cpu_id, uint64_t *idle);
+extern void hakios_cputop(uint64_t interval_ms);       /* osfmk/arm64/loader_return.c */
 
 /*
  * The loader's log as well: this runs early, and the kernel's own log of a run keeps only its end. With
@@ -304,12 +305,16 @@ load_thread(void *arg __unused, wait_result_t wr __unused)
 	const ml_topology_info_t *topology = ml_get_topology_info();
 	uint64_t idle_before[MAX_CPUS] = { 0 }, then = mach_absolute_time();
 
-	for (;;) {
+	for (uint32_t round = 1;; round++) {
 		char line[192];
 		int at;
 		uint64_t now, us;
 
 		delay_for_interval(load_every_ms, NSEC_PER_MSEC);
+		/* ... and every five of them, the busiest threads (osfmk/arm64/loader_return.c) */
+		if (round % 5 == 0) {
+			hakios_cputop(5ull * load_every_ms);
+		}
 		now = mach_absolute_time();
 		absolutetime_to_nanoseconds(now, &us);
 		at = snprintf(line, sizeof(line), "tl: u at %llu", us / 1000);
