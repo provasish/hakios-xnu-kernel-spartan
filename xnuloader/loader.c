@@ -15,7 +15,15 @@
 /* ------------------------------------------------------------------------ */
 /* Fixed conventions shared with the boot shim, the packer and the kernel   */
 
-#define PAYLOAD_BASE        0xF0000000ULL
+/*
+ * Where the payload is: where the boot shim or U-Boot put it (0xF0000000), until spartan_move_payload() moves it
+ * to a block of its own (0xA0000000 on spartan: there 0xF0000000 splits the free RAM in two, and the kernel's window
+ * was only the part above it).
+ */
+#define PAYLOAD_BASE_FIXED  0xF0000000ULL
+#define PAYLOAD_BASE        payload_base
+static uint64_t payload_base = PAYLOAD_BASE_FIXED;
+static uint64_t payload_moved_from;  /* 0, or the address U-Boot put the payload at (its reservation; no longer used) */
 #define PAYLOAD_MAGIC       0x50554E58u /* "XNUP" */
 
 struct payload_header { uint32_t magic; uint32_t size; };
@@ -2783,6 +2791,39 @@ print_memory_map(void)
 	}
 }
 
+/* RAM the kernel's window may take: free RAM, and U-Boot's payload area once the payload has been moved out of it */
+static int
+window_usable(const efi_memory_descriptor *d)
+{
+	return d->type == EfiConventionalMemory ||
+	       (payload_moved_from != 0 && d->phys_start >= payload_moved_from &&
+	       d->phys_start + (d->pages << 12) <= payload_moved_from + PAYLOAD_MAX_SIZE);
+}
+
+/*
+ * Spartan: U-Boot keeps 0xF0000000 for the payload it hands over (its device tree), and that splits the phone's free
+ * RAM: 768 MB below, 3.5 GB above, which was all the kernel had, the 2.3 GB system image in it. Once the loader runs,
+ * the payload goes to a block of its own (0xA0000000, free RAM no firmware reserves: Android's tree keeps
+ * 0x9FE00000-0xA0000000 and 0xB0000000-0xB0400000 only), and the window may run through U-Boot's old area: some
+ * 830 MB more for the kernel. Nothing of U-Boot's is there: the loader image runs from memory of its own.
+ */
+#define SPARTAN_PAYLOAD_BASE 0xA0000000ULL
+
+static void
+spartan_move_payload(void)
+{
+	uint64_t to = SPARTAN_PAYLOAD_BASE;
+
+	if (payload_moved_from != 0 ||
+	    EFI_ERROR(BS->allocate_pages(AllocateAddress, EfiLoaderData, PAYLOAD_MAX_SIZE >> 12, &to)) ||
+	    to != SPARTAN_PAYLOAD_BASE) {
+		return;                 /* the payload stays where it is, and the window is what it was */
+	}
+	memcpy((void *)(uintptr_t)to, (const void *)(uintptr_t)payload_base, PAYLOAD_MAX_SIZE);
+	payload_moved_from = payload_base;
+	payload_base = to;
+}
+
 static int
 choose_window(const struct payload_info *pi)
 {
@@ -2801,10 +2842,21 @@ choose_window(const struct payload_info *pi)
 	}
 	for (uint64_t off = 0; off < map_size; off += desc_size) {
 		efi_memory_descriptor *d = (efi_memory_descriptor *)(map_buf + off);
-		if (d->type != EfiConventionalMemory) {
+		if (!window_usable(d)) {
 			continue;
 		}
 		uint64_t lo = d->phys_start, hi = d->phys_start + (d->pages << 12);
+		/* ... and whatever usable range follows it without a gap (spartan: free RAM, U-Boot's old payload area, free RAM) */
+		for (int grew = 1; grew;) {
+			grew = 0;
+			for (uint64_t o2 = 0; o2 < map_size; o2 += desc_size) {
+				efi_memory_descriptor *e = (efi_memory_descriptor *)(map_buf + o2);
+				if (e->phys_start == hi && e->pages != 0 && window_usable(e)) {
+					hi += e->pages << 12;
+					grew = 1;
+				}
+			}
+		}
 		/* the payload sits in RAM that UEFI may consider free: stay clear of it */
 		if (lo < pay_hi && hi > pay_lo) {
 			if (pay_lo - lo > hi - pay_hi && pay_lo > lo) {
@@ -2828,9 +2880,29 @@ choose_window(const struct payload_info *pi)
 	if (best_size > MAX_MEM_SIZE) {
 		best_size = MAX_MEM_SIZE;
 	}
-	/* UEFI stays alive while the kernel runs, so the kernel must own all of its window. */
-	uint64_t claim = best_base;
-	efi_status s = BS->allocate_pages(AllocateAddress, EfiLoaderData, best_size >> 12, &claim);
+	/*
+	 * UEFI stays alive while the kernel runs, so the kernel must own all of its window: claimed whole, or (a window
+	 * made of several ranges) every free range in it, U-Boot's old payload area being reserved already.
+	 */
+	efi_status s = 0;
+	if (pi->forced_base != 0 || payload_moved_from == 0) {
+		uint64_t claim = best_base;
+		s = BS->allocate_pages(AllocateAddress, EfiLoaderData, best_size >> 12, &claim);
+	} else {
+		for (uint64_t off = 0; off < map_size && !EFI_ERROR(s); off += desc_size) {
+			efi_memory_descriptor *d = (efi_memory_descriptor *)(map_buf + off);
+			uint64_t lo = d->phys_start, hi = d->phys_start + (d->pages << 12);
+			if (d->type != EfiConventionalMemory) {
+				continue;
+			}
+			lo = lo > best_base ? lo : best_base;
+			hi = hi < best_base + best_size ? hi : best_base + best_size;
+			if (hi > lo) {
+				uint64_t claim = lo;
+				s = BS->allocate_pages(AllocateAddress, EfiLoaderData, (hi - lo) >> 12, &claim);
+			}
+		}
+	}
 	print("phys window %x size %x, claim status %x\n", best_base, best_size, s);
 	if (EFI_ERROR(s)) {
 		return 0;
@@ -4372,6 +4444,7 @@ efi_main(efi_handle image, efi_system_table *st)
 			PLAT = &platform_redwood;
 		} else if (SCREEN.base == 0x9C000000ULL) {
 			PLAT = &platform_spartan;   /* kona's continuous-splash memory, as ABL leaves it */
+			spartan_move_payload();
 			log_partition_off = 1;
 		} else {
 			ramfb_phone_screen();
