@@ -756,6 +756,7 @@ probeDisplay(void)
 #define MDP_INTR_STATUS         0x1014
 #define MDP_INTR_CLEAR          0x1018
 #define MDP_INTR_PP0_DONE       (1u << 8)
+#define MDP_INTR_INTF1_UNDERRUN (1u << 26)              /* (Linux dpu_hw_interrupts.c: INTF_1_UNDERRUN) */
 #define CTL0_TOP                0x2014
 #define CTL0_FLUSH              0x2018
 #define CTL0_START              0x201c
@@ -776,6 +777,16 @@ static uint32_t gAutorefresh;           /* the firmware's setting, back for the 
 static bool gPushing;                   /* autorefresh off: frames are pushed */
 static uint64_t gPushed;                /* when the last push was started; 0: none in flight */
 static uint32_t gPushFailures, gPushes, gPushWaitsLong;
+/*
+ * Where the panel's scan is when a push starts (INTF1's tear-check line counter, in eighths of the frame's lines; the
+ * ninth: past them) and, for one push in 30, how long it takes and where the scan is when it is done: a push not held
+ * for the panel's TE, or one slower than a scan, is a tear (spartan, 19 November: tears anywhere on the screen).
+ */
+static uint32_t gPushStartAt[9], gPushTimed, gPushTimeMax, gPushTimeSum, gPushEndAt[9], gPushUnderruns;
+/* ... of those timed: how long from the start command until the interface began to send (in ms, 0-15+), and the sending */
+static uint32_t gPushStartWait[16], gPushSendMin, gPushSendMax;
+#define INTF1_FRAME             0x6b8ac
+#define INTF1_LINE              0x6b8b0
 
 static void
 displayWrite(unsigned offset, uint32_t value)
@@ -800,7 +811,7 @@ pushStop(void)
 static bool
 pushStart(unsigned height)
 {
-	if (gPush != 1 || !spartanDisplay() || !mapDisplay()) {
+	if ((gPush != 1 && gPush != 2) || !spartanDisplay() || !mapDisplay()) {
 		return false;
 	}
 	uint32_t top = displayReg(gDPU, CTL0_TOP), intf = displayReg(gDPU, CTL0_INTF_ACTIVE);
@@ -857,6 +868,11 @@ pushWait(void)
 		IODelay(200);
 	}
 	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
+	/* (and did the interface run dry on the way: an underrun -- the MDP not fed from memory in time -- is a torn frame) */
+	if (displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_INTF1_UNDERRUN) {
+		gPushUnderruns++;
+		displayWrite(MDP_INTR_CLEAR, MDP_INTR_INTF1_UNDERRUN);
+	}
 	uint64_t ns;
 
 	/* (how long this waited, not how long ago the push was: a pause in the drawing is no slow push) */
@@ -871,14 +887,61 @@ pushWait(void)
 static void
 pushFrame(void)
 {
+	const uint32_t lines = vinfo.v_height != 0 ? vinfo.v_height : 2400;
+	uint32_t line;
+
 	__asm__ volatile ("dsb sy" ::: "memory");
 	gPushed = mach_absolute_time();
 	displayWrite(MDP_INTR_CLEAR, MDP_INTR_PP0_DONE);
 	displayWrite(CTL0_FLUSH, CTL_FLUSH_FRAME);
+	line = displayReg(gDPU, INTF1_TE_LINE) & 0xffff;
 	displayWrite(CTL0_START, 1);
 	__asm__ volatile ("dsb sy" ::: "memory");
+	gPushStartAt[MIN(line * 8 / lines, 8u)]++;
+	if (gPush == 2 && gPushes % 10 == 0) {      /* (fb_push=2: also timed, one push in ten: it costs a busy-wait) */
+		uint64_t start = mach_absolute_time(), deadline, ns;
+
+		uint32_t line0 = displayReg(gDPU, INTF1_LINE), frame0 = displayReg(gDPU, INTF1_FRAME);
+		uint64_t moved = 0;
+
+		clock_interval_to_deadline(40, kMillisecondScale, &deadline);
+		while (!(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE) && mach_absolute_time() < deadline) {
+			/* (when the interface starts sending: its line counter moves, or its frame counter) */
+			if (moved == 0 && (displayReg(gDPU, INTF1_LINE) != line0 || displayReg(gDPU, INTF1_FRAME) != frame0)) {
+				moved = mach_absolute_time();
+			}
+			IODelay(20);
+		}
+		if (moved != 0) {
+			uint64_t wait;
+
+			absolutetime_to_nanoseconds(moved - start, &wait);
+			gPushStartWait[MIN((uint32_t)(wait / 1000000), 15u)]++;
+			absolutetime_to_nanoseconds(mach_absolute_time() - moved, &wait);
+			gPushSendMax = MAX(gPushSendMax, (uint32_t)(wait / 1000));
+			gPushSendMin = gPushSendMin == 0 ? (uint32_t)(wait / 1000) : MIN(gPushSendMin, (uint32_t)(wait / 1000));
+		}
+		absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+		line = displayReg(gDPU, INTF1_TE_LINE) & 0xffff;
+		gPushEndAt[MIN(line * 8 / lines, 8u)]++;
+		gPushTimed++;
+		gPushTimeSum += (uint32_t)(ns / 1000);
+		gPushTimeMax = MAX(gPushTimeMax, (uint32_t)(ns / 1000));
+	}
 	if (++gPushes == 1 || gPushes % 600 == 0) {
-		displayLog("display: %u frames pushed, %u waits over 20 ms\n", gPushes, gPushWaitsLong);
+		displayLog("display: %u frames pushed, %u waits over 20 ms, %u underruns; MDP interrupts now %#x, INTF1 tear status %#x\n",
+		    gPushes, gPushWaitsLong, gPushUnderruns, displayReg(gDPU, MDP_INTR_STATUS), displayReg(gDPU, 0x6e804));
+		displayLog("display: scan line at push start (eighths, then past): %u %u %u %u %u %u %u %u %u; line now %#x\n",
+		    gPushStartAt[0], gPushStartAt[1], gPushStartAt[2], gPushStartAt[3], gPushStartAt[4], gPushStartAt[5],
+		    gPushStartAt[6], gPushStartAt[7], gPushStartAt[8], displayReg(gDPU, INTF1_TE_LINE));
+		displayLog("display: wait until the interface sends (ms 0..15): %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u; "
+		    "sending %u..%u us\n", gPushStartWait[0], gPushStartWait[1], gPushStartWait[2], gPushStartWait[3], gPushStartWait[4],
+		    gPushStartWait[5], gPushStartWait[6], gPushStartWait[7], gPushStartWait[8], gPushStartWait[9], gPushStartWait[10],
+		    gPushStartWait[11], gPushStartWait[12], gPushStartWait[13], gPushStartWait[14], gPushStartWait[15], gPushSendMin,
+		    gPushSendMax);
+		displayLog("display: %u pushes timed: %u us on average, %u at most; scan line when done: %u %u %u %u %u %u %u %u %u\n",
+		    gPushTimed, gPushTimed ? gPushTimeSum / gPushTimed : 0, gPushTimeMax, gPushEndAt[0], gPushEndAt[1], gPushEndAt[2],
+		    gPushEndAt[3], gPushEndAt[4], gPushEndAt[5], gPushEndAt[6], gPushEndAt[7], gPushEndAt[8]);
 	}
 }
 
@@ -956,14 +1019,21 @@ panelTake(uint32_t width, uint32_t height)
 static IOReturn
 panelAcquire(task_t task, uint64_t * out)
 {
-	uint64_t deadline;
+	uint64_t deadline, stale;
 
 	if (gPanel == NULL || !gPushing) {
 		return kIOReturnNotReady;
 	}
 	clock_interval_to_deadline(PUSH_TIMEOUT_MS, kMillisecondScale, &deadline);
+	nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &stale);
 	IOLockLock(gPanelLock);
-	while (gPanelState == kPanelCopying || gPanelState == kPanelDrawing || pushInFlight()) {
+	/*
+	 * Not while a frame drawn there waits for its push either (kPanelReady): the next one drawn over it then was pushed
+	 * half one, half the other -- the glitches seen while swiping (19 November). A ready frame no swap came for in
+	 * 100 ms is given up.
+	 */
+	while (gPanelState == kPanelCopying || gPanelState == kPanelDrawing || pushInFlight() ||
+	    (gPanelState == kPanelReady && mach_absolute_time() - gPanelSince < stale)) {
 		if (mach_absolute_time() >= deadline) {
 			IOLockUnlock(gPanelLock);
 			return kIOReturnBusy;
@@ -1938,7 +2008,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		MiniIOSurface * s0 = surfaces[0];
 		int32_t src[4], dst[4];
 		uint64_t limit, stale;
-		bool whole;
+		bool whole, gpuTouched = false;
 
 		memcpy(src, swap + SWAP_SOURCE(0), sizeof(src));
 		memcpy(dst, swap + SWAP_DEST(0), sizeof(dst));
@@ -1960,10 +2030,19 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				IODelay(200);
 				IOLockLock(gPanelLock);
 			}
+			gpuTouched = gPanelState == kPanelDrawing || gPanelState == kPanelReady;
 			gPanelState = kPanelCopying;
 			fPanelFrame = false;
 		}
 		IOLockUnlock(gPanelLock);
+		/*
+		 * A frame the GPU drew there (of another surface, or not said ready in time) may still be on its way into the
+		 * panel's memory: copied over before it has landed, the two were pushed mixed. Its work is waited for first.
+		 */
+		if (gpuTouched && !MiniIOSurfaceDrawn(gPanel, SWAP_GPU_MS)) {
+			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU's frame in the panel's memory not done after %u ms\n",
+			    swapWord(swap, SWAP_ID), SWAP_GPU_MS);
+		}
 		if (fPanelFrame && !MiniIOSurfaceDrawn(gPanel, SWAP_GPU_MS)) {
 			IOLog("MiniIOMobileFramebuffer: swap %u: the GPU is not done with the panel's memory after %u ms; copied instead\n",
 			    swapWord(swap, SWAP_ID), SWAP_GPU_MS);
