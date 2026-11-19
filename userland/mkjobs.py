@@ -226,6 +226,10 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
+# DENY_MORE="word ..." stops more of them. DENY_MORE=chronod: no home-screen widgets -- on spartan (19 November) chronod's
+# dozen widget extensions took more processor time than the window server and SpringBoard together while the Today
+# view was swiped to and from, the frames late meanwhile.
+DENY = DENY + tuple(os.environ.get('DENY_MORE', '').split())
 
 args = sys.argv[1:]
 rest = '--rest' in args
