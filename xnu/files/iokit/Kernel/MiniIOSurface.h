@@ -117,6 +117,13 @@ public:
 	task_t                          clientTask;     /* whose memory it is (not held: only compared) */
 	mach_vm_address_t               clientAddress;  /* ... and where it is there */
 	uint8_t *                       kpixels;        /* where the pixel memory starts in the kernel, either way */
+	/*
+	 * ... or a panel buffer (MiniIOSurfaceCreateScanout): the pixels are the display's own memory, write-combined
+	 * here, for the GPU of the one task that may use it (`scanoutOwner`) to draw a frame into; no task maps it.
+	 */
+	IOMemoryDescriptor *            scanout;
+	IOMemoryMap *                   scanoutMap;
+	task_t                          scanoutOwner;   /* (not held: only compared) */
 	uint32_t                        drawn;          /* the GPU's last submission that names the pixels (0: none; hakios.gpu.cpp) */
 	struct minisurf_result          info;           /* addresses not filled in */
 	struct minisurf_plane           planes[MINISURF_MAX_PLANES];
@@ -166,6 +173,8 @@ void            MiniIOSurfaceClearKept(void);
 /* Wait, for so many milliseconds at most, until the GPU is done with a surface's pixels (hakios.gpu.cpp). */
 bool            MiniIOSurfaceDrawn(MiniIOSurface * surface, uint64_t milliseconds);
 MiniIOSurface * MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat);
+/* A 'BGRA' surface whose pixels are physical memory of the display's, bytesPerRow apart (the framebuffer's fb_gpu). */
+MiniIOSurface * MiniIOSurfaceCreateScanout(uint64_t phys, uint32_t width, uint32_t height, uint32_t bytesPerRow);
 void            MiniIOSurfaceDrop(MiniIOSurface * surface);
 /* A Mach send right for the surface in the task (what IOSurfaceCreateMachPort gives); 0 on failure. */
 mach_port_name_t MiniIOSurfaceMakeSendRight(task_t task, MiniIOSurface * surface);

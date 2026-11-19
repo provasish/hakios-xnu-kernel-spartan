@@ -94,6 +94,7 @@ fb_beat	k
 fb_ca_hz	k
 fb_diff	k
 fb_filter	k
+fb_gpu	k
 fb_hz	k
 fb_intf	k
 fb_measure	k
@@ -119,6 +120,7 @@ glframes	u
 glgroup	u
 glno	u
 glnumbers	u
+glpanel	u
 glplain	u
 glprecision	u
 glprof	u

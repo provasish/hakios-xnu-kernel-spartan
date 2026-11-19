@@ -845,6 +845,135 @@ target_to_surface(struct eagl *e, struct image *image)
 }
 
 /*
+ * The panel's own memory as the frame's last stop (the framebuffer's fb_gpu, iokit/Kernel/MiniIOMobileFramebuffer.cpp:
+ * selectors 200 and 201). Where the display's driver pushes the frame to a command-mode panel (spartan, fb_push=1), it
+ * would otherwise scale it into the panel's memory with the processor, 5 to 14 ms a frame. Here the GPU does it, with the
+ * frame still in its own memory: the display surface's texture is copied, scaled, into a texture that IS the panel's
+ * memory, and the driver is told the frame of that surface is there; the swap that follows is pushed as it is.
+ * Boot-arg glpanel=0: frames are copied by the display's driver, as before. Nothing of this where the driver has no
+ * panel buffer (it says so, kIOReturnNotReady, and is asked again now and then).
+ */
+#ifndef GL_LINEAR
+#define GL_LINEAR               0x2601
+#endif
+#define FB_PANEL_ACQUIRE        200
+#define FB_PANEL_READY          201
+#define PANEL_NOT_READY_MAX     2000            /* frames asked without a panel buffer before giving up for the run */
+
+static int panel_gpu = 1;
+static io_connect_t panel_connection;
+static bool panel_opened;
+static unsigned panel_not_ready, panel_drawn, panel_busy, panel_said;
+static GLuint panel_texture, panel_framebuffer;
+static uint32_t panel_surface, panel_width, panel_height;
+static uint32_t panel_pending;                  /* the display surface whose frame was drawn into it: 201 after the frame's end */
+
+static bool
+panel_open(void)
+{
+	io_service_t display;
+
+	if (panel_opened) {
+		return panel_connection != 0;
+	}
+	panel_opened = true;
+	display = IOServiceGetMatchingService(0, IOServiceMatching("IOMobileFramebuffer"));
+	if (display == 0 || IOServiceOpen(display, mach_task_self(), 0, &panel_connection) != KERN_SUCCESS) {
+		panel_connection = 0;
+	}
+	if (display != 0) {
+		IOObjectRelease(display);
+	}
+	say("hakios-gl: the display's driver %s\n", panel_connection != 0 ? "opened for the panel's memory (fb_gpu)" :
+	    "cannot be opened: frames are copied by it");
+	return panel_connection != 0;
+}
+
+/* The finished frame of a display-sized target, scaled into the panel's memory by the GPU; true: the driver is to be told. */
+static bool
+panel_draw(struct eagl *e, struct image *image)
+{
+	uint64_t out[5] = { 0 };
+	uint32_t count = 5;
+	kern_return_t kr;
+	GLint read = 0, draw = 0, bound = 0;
+
+	if (!panel_gpu || panel_not_ready >= PANEL_NOT_READY_MAX || !image->target || !image->drawn ||
+	    image->width < 1000 || image->height < 2000 || (!image->shared && image->mirror == 0) || !panel_open()) {
+		return false;
+	}
+	kr = IOConnectCallScalarMethod(panel_connection, FB_PANEL_ACQUIRE, NULL, 0, out, &count);
+	if (kr != KERN_SUCCESS || count < 5) {
+		if (kr == kIOReturnBusy) {
+			panel_busy++;
+		} else if (++panel_not_ready == PANEL_NOT_READY_MAX) {
+			say("hakios-gl: the display's driver has no panel buffer (%#x): frames are copied by it\n", kr);
+		}
+		return false;
+	}
+	panel_not_ready = 0;
+	if (out[1] != panel_surface || panel_texture == 0) {
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+		if (panel_texture == 0) {
+			glGenTextures(1, &panel_texture);
+		}
+		glBindTexture(GL_TEXTURE_2D, panel_texture);
+		if (!hakios_gl_surface_texture(e->gl, (uint32_t)out[1])) {
+			glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+			say("hakios-gl: the panel's memory (surface %llu, %llux%llu, rows of %llu) cannot be a texture: frames are copied by "
+			    "the display's driver\n", out[1], out[2], out[3], out[4]);
+			panel_gpu = 0;
+			return false;
+		}
+		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+		if (panel_framebuffer == 0) {
+			glGenFramebuffers(1, &panel_framebuffer);
+		}
+		panel_surface = (uint32_t)out[1];
+		panel_width = (uint32_t)out[2];
+		panel_height = (uint32_t)out[3];
+		say("hakios-gl: the panel's memory is surface %u, %ux%u, rows of %llu bytes: frames are scaled into it here\n",
+		    panel_surface, panel_width, panel_height, out[4]);
+	}
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+	if (e->reader == 0) {
+		glGenFramebuffers(1, &e->reader);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, e->reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, panel_framebuffer);
+	glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, panel_texture, 0);
+	/* (the same way up as the copy into the surface, target_to_surface(): the panel's rows are a surface's rows) */
+	glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? (GLint)panel_height : 0, (GLint)panel_width,
+	    image->invert ? 0 : (GLint)panel_height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
+	panel_pending = IOSurfaceGetID(image->surface);
+	panel_drawn++;
+	return true;
+}
+
+/* After the frame's end has sent its work to the GPU: the driver told which frame is in the panel's memory. */
+static void
+panel_ready(void)
+{
+	uint64_t in[2] = { 0, panel_pending };
+	kern_return_t kr;
+
+	if (panel_pending == 0) {
+		return;
+	}
+	kr = IOConnectCallScalarMethod(panel_connection, FB_PANEL_READY, in, 2, NULL, NULL);
+	panel_pending = 0;
+	if ((kr != KERN_SUCCESS && panel_said < 8) || panel_drawn == 1 || panel_drawn % 600 == 0) {
+		panel_said += kr != KERN_SUCCESS;
+		say("hakios-gl: %u frames scaled into the panel's memory, %u times it was busy; the last one said: %#x\n", panel_drawn,
+		    panel_busy, kr);
+	}
+}
+
+/*
  * For looking at what is drawn on the way to the picture (boot-arg glshow=TEXTURE): that texture's
  * pixels are put over the top left corner of the picture as it goes out. glshow=WxH takes, instead
  * of a name that is a new one every run, whichever texture is of that size; glshow_part=W,H only
@@ -1179,6 +1308,10 @@ frame_end(struct eagl *e, bool finished)
 	clear_now(e);
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
+		/* (first: target_to_surface() below takes `drawn` away from a mirrored target; the frame is in its texture either way) */
+		if (!finished && panel_pending == 0 && panel_draw(e, &e->images[i])) {
+			glFlush();                              /* (the scaling into the panel's memory goes with the frame) */
+		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
 			in_place++;
@@ -1206,6 +1339,7 @@ frame_end(struct eagl *e, bool finished)
 			glDeleteSync(sync);
 		}
 	}
+	panel_ready();                  /* (before the swap that shows it reaches the display's driver) */
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
@@ -4313,6 +4447,7 @@ install(void)
 		}
 		share_surfaces = strstr(arguments, "glcopy=1") == NULL;
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
+		panel_gpu = strstr(arguments, "glpanel=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
 			wait_for_frames = 0;

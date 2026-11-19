@@ -287,6 +287,8 @@ MiniIOSurface::free(void)
 
 	OSSafeReleaseNULL(values);
 	OSSafeReleaseNULL(clientMap);
+	OSSafeReleaseNULL(scanoutMap);
+	OSSafeReleaseNULL(scanout);
 	if (client != NULL) {
 		client->complete();
 		client->release();
@@ -444,7 +446,7 @@ describeComponents(struct minisurf_plane * plane, uint32_t format)
  * Returned with one holder, and entered in the table.
  */
 static MiniIOSurface *
-surfaceCreate(OSDictionary * props, IOReturn * error)
+surfaceCreate(OSDictionary * props, IOReturn * error, IOMemoryMap * scanout = NULL)
 {
 	MiniIOSurface * s;
 	struct minisurf_result * info;
@@ -620,7 +622,9 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		s->release();
 		return NULL;
 	}
-	if (wrapped == NULL) {
+	if (scanout != NULL) {
+		alloc = (uint32_t) needed;              /* (the display's memory: as big as the rows, nothing of ours) */
+	} else if (wrapped == NULL) {
 		alloc = alignUp(alloc, (uint32_t) PAGE_SIZE);
 	} else {
 		/* (the memory is as big as its owner says, and not a byte of ours is added to it) */
@@ -632,7 +636,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 		}
 	}
 
-	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped ? 0 : alloc));
+	s->memory = surfaceMemory((vm_size_t) PAGE_SIZE + (wrapped || scanout ? 0 : alloc));
 	if (s->memory == NULL) {
 		IOLog("MiniIOSurface: no memory for %u bytes (%u surfaces, %llu MB in use)\n", alloc, gSurfaceCount,
 		    gSurfaceBytes >> 20);
@@ -642,7 +646,7 @@ surfaceCreate(OSDictionary * props, IOReturn * error)
 	}
 	s->kbase = (uint8_t *) s->memory->getBytesNoCopy();
 	s->values = OSDictionary::withCapacity(4);
-	s->kpixels = s->kbase + PAGE_SIZE;
+	s->kpixels = scanout != NULL ? (uint8_t *) scanout->getVirtualAddress() : s->kbase + PAGE_SIZE;
 	if (wrapped != NULL) {
 		s->clientTask = current_task();
 		s->clientAddress = wrapped->unsigned64BitValue();
@@ -800,6 +804,40 @@ MiniIOSurfaceCreateSimple(uint32_t width, uint32_t height, uint32_t pixelFormat)
 	n = OSNumber::withNumber(pixelFormat, 32); props->setObject("IOSurfacePixelFormat", n); n->release();
 	s = surfaceCreate(props, &error);
 	props->release();
+	return s;
+}
+
+/*
+ * A panel buffer: the display's own memory at `phys` as a surface, for the window server's GPU to scale a frame into
+ * (the framebuffer's fb_gpu). After the OnePlus 8 Pro port's (dekefake/hackios-op8pro, MiniIOSurface.cpp).
+ */
+MiniIOSurface *
+MiniIOSurfaceCreateScanout(uint64_t phys, uint32_t width, uint32_t height, uint32_t bytesPerRow)
+{
+	/* (whole pages: the GPU maps it by the page, hakios.gpu.cpp) */
+	IOMemoryDescriptor * pixels = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) phys,
+	    round_page_64((uint64_t) bytesPerRow * height), kIODirectionInOut);
+	IOMemoryMap * map = pixels != NULL ? pixels->map(kIOMapWriteCombineCache) : NULL;
+	OSDictionary * props = OSDictionary::withCapacity(4);
+	MiniIOSurface * s = NULL;
+	IOReturn error;
+
+	if (map != NULL && props != NULL && gSurfaceLock != NULL) {
+		OSNumber * n;
+		n = OSNumber::withNumber(width, 32); props->setObject("IOSurfaceWidth", n); n->release();
+		n = OSNumber::withNumber(height, 32); props->setObject("IOSurfaceHeight", n); n->release();
+		n = OSNumber::withNumber('BGRA', 32); props->setObject("IOSurfacePixelFormat", n); n->release();
+		n = OSNumber::withNumber(bytesPerRow, 32); props->setObject("IOSurfaceBytesPerRow", n); n->release();
+		s = surfaceCreate(props, &error, map);
+	}
+	OSSafeReleaseNULL(props);
+	if (s == NULL) {
+		OSSafeReleaseNULL(map);
+		OSSafeReleaseNULL(pixels);
+		return NULL;
+	}
+	s->scanout = pixels;
+	s->scanoutMap = map;
 	return s;
 }
 
@@ -1028,6 +1066,9 @@ IOSurfaceRootUserClient::addRef(MiniIOSurface * surface)
 		}
 		fRefs = refs;
 		fRefCapacity = capacity;
+	}
+	if (surface->scanout != NULL) {
+		return NULL;            /* (a panel buffer: only the GPU of its owner draws into it, see hakios.gpu.cpp) */
 	}
 	map = surface->memory->createMappingInTask(fTask, 0, kIOMapAnywhere);
 	if (map == NULL) {
