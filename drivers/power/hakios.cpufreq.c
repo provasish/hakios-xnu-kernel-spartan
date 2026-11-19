@@ -18,6 +18,7 @@
 #include <mach/mach_types.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
 #include <sys/hakios.input.h>
 #include <sys/systm.h>
 #include <vm/vm_kern.h>
@@ -86,15 +87,48 @@ domain_of(uint32_t phys_id)
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
-static void
-raise_domain(uint32_t domain, uint32_t cores)
+/*
+ * SM8250 "kona" (the realme GT Neo 3T, spartan) has the same three domains at the same addresses, but
+ * the older layout ("qcom,cpufreq-hw", OSM): rows of 32 bytes from 0x110 (the same word: [31:30] the
+ * source, [7:0] the multiple of 19.2 MHz, [18:16] the cores it is for) and the wanted row at 0x920;
+ * bit 0 of the word at 0 says the firmware has the block on. Domains: cores 0-3, 4-6, 7.
+ */
+#define OSM_ENABLE              0x0
+#define OSM_FREQ_TABLE          0x110
+#define OSM_ROW_SIZE            32
+#define OSM_PERF_STATE          0x920
+
+static bool
+is_kona(void)
 {
-	uint32_t top = 0, top_khz = 0, was;
+	static const char platform[] = "spartan";
+	const void *value;
+	unsigned int size;
+	DTEntry arm_io;
+
+	return SecureDTLookupEntry(NULL, "/arm-io", &arm_io) == kSuccess &&
+	       SecureDTGetProperty(arm_io, "device_type", &value, &size) == kSuccess &&
+	       size == sizeof(platform) && memcmp(value, platform, sizeof(platform)) == 0;
+}
+
+static void
+raise_domain(uint32_t domain, uint32_t cores, bool kona)
+{
+	const uint32_t table = kona ? OSM_FREQ_TABLE : EPSS_FREQ_TABLE, row_size = kona ? OSM_ROW_SIZE : 4;
+	const uint32_t perf_state = kona ? OSM_PERF_STATE : EPSS_PERF_STATE;
+	uint32_t top = 0, top_khz = 0, was, rows = 0;
 	vm_offset_t base;
+	char list[200];
+	int at = 0;
 
 	base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
+	if (kona && (*(volatile uint32_t *)(base + OSM_ENABLE) & 1) == 0) {
+		tell("cpufreq: group %u: the firmware left the block off; left alone\n", domain);
+		return;
+	}
+	list[0] = 0;
 	for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
-		uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
+		uint32_t entry = *(volatile uint32_t *)(base + table + row_size * row);
 		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
 
 		if (row > 0 && khz <= top_khz) {
@@ -102,9 +136,18 @@ raise_domain(uint32_t domain, uint32_t cores)
 		}
 		top = row;
 		top_khz = khz;
+		rows++;
+		if (at < (int)sizeof(list) - 8) {
+			at += snprintf(list + at, sizeof(list) - at, " %u", khz / 1000);
+		}
 	}
-	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
-	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
+	was = *(volatile uint32_t *)(base + perf_state);
+	if (top_khz == 0 || rows < 2) {
+		tell("cpufreq: group %u: no usable frequency table (%u rows); left at row %u\n", domain, rows, was);
+		return;
+	}
+	tell("cpufreq: group %u: %u rows (MHz):%s\n", domain, rows, list);
+	*(volatile uint32_t *)(base + perf_state) = top;
 	delay_for_interval(20, NSEC_PER_MSEC);
 	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
 	    top_khz / 1000);
@@ -581,9 +624,10 @@ hakios_cpufreq_init(void)
 	/* (whichever core this thread happens to be on, and stays on or not: it only goes to the log) */
 	here = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
 	before = loop_speed();
+	const bool kona = is_kona();
 	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
 		if (cores[domain] != 0) {
-			raise_domain(domain, cores[domain]);
+			raise_domain(domain, cores[domain], kona);
 		}
 	}
 	printf("cpufreq: on core %u a loop ran at %u, now at %u\n", here, before, loop_speed());
