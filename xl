@@ -25,7 +25,8 @@
 #
 # Logs land in logs/. Environment for `run`:
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
-#               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
+#               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls);
+#               devices/$DEVICE/bootargs, if there is one, is added after it (XL_DEFAULTS=0: not)
 #   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
 #   XL_FOLLOW=N fetch the kernel's log every N seconds during a run (default 10; XL_FOLLOW= for never), so that a kernel
 #               that hangs leaves what it said in logs/<time>-run.log.live; after a hang `run` brings the phone back to
@@ -209,6 +210,11 @@ run() { # run <oem command> <label>
 		# A run about Wi-Fi is given the radio's own address, which is this phone's and so is kept in a
 		# file that is not in the repository: fw-wifi/mac, one line, six bytes in hexadecimal with colons.
 		local args=${XL_CMDLINE--v}
+		# The device's own defaults (devices/$DEVICE/bootargs, '#' comments), after what was given: the kernel takes
+		# the first of two of a name, so XL_CMDLINE's win. XL_DEFAULTS=0 leaves them out.
+		if [ "${XL_DEFAULTS:-1}" != 0 ] && [ -f "devices/${DEVICE:-redwood}/bootargs" ]; then
+			args="$args $(sed 's/#.*//' "devices/${DEVICE:-redwood}/bootargs" | tr -s ' \t\r\n' ' ')"
+		fi
 		case " $args " in
 		*" wifi="*|*" wifi_step="*) [ -s fw-wifi/mac ] && args="$args wifi_mac=$(tr -d ' \n\r' < fw-wifi/mac)" ;;
 		esac
