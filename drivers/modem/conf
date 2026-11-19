@@ -14,3 +14,8 @@ driver MODEM
 	requires QMI UFS
 	help    the modem (modem=1): started, its file systems served from the flash, the IPA's data path as en1,
 	help    the SIM and the network registration. Research; needs fw-modem/ from the phone
+
+driver MHI
+	file    bsd/dev/hakios.mhi.c
+	help    an MHI host (Qualcomm's Modem-Host Interface over PCIe: rings, the boot interfaces BHI/BHIe, channels) for an
+	help    external modem such as SM8250 phones' X55. From the OnePlus 8 port (dekefake/hackios-op8pro, APSL 2.0)

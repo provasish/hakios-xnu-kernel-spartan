@@ -292,4 +292,11 @@ hakios_input_init(void)
 	hakios_wifi_init();
 	hakios_adsp_init();
 	hakios_mpss_init();
+#ifdef HAKIOS_SPARTAN_MODEM
+	{
+		extern void hakios_spartan_modem_init(void);     /* devices/spartan: the X55 on PCIe 2 (modem=N) */
+
+		hakios_spartan_modem_init();
+	}
+#endif
 }

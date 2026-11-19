@@ -699,7 +699,13 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# MPSS firmware is much too large for the small boot image. Keep it in the system APFS,
 	# only when explicitly requested, after checking every loadable segment against this DTB.
 	# This stages the files; a separate XNU MPSS driver is still required to start the modem.
-	if [ -n "$MODEM" ]; then
+	# An external X55 modem on PCIe (spartan: devices/spartan/drivers/modem/hakios.spartan_modem.c) boots from the firmware
+	# partition's image/sdx55m and reads its carrier configurations from image/modem_pr over TFTP: the phone's
+	# /vendor/firmware_mnt/image/{sdx55m,modem_pr,sdx55} in ../fw-modem/image (105 MB), at /fw/modem/image here.
+	if [ -n "$MODEM" ] && [ -d ../fw-modem/image/sdx55m ]; then
+		mkdir -p sysroot/fw/modem
+		rm -rf sysroot/fw/modem/image && cp -R ../fw-modem/image sysroot/fw/modem/image
+	elif [ -n "$MODEM" ]; then
 		[ -f ../fw-modem/modem.mdt ] || { echo "build.sh: MODEM=1 needs ../fw-modem/modem.mdt" >&2; exit 1; }
 		../devices/redwood/tools/modem_firmware.py --dtb ../devices/redwood/prebuilt/device-tree.dtb --firmware-dir ../fw-modem \
 			--node /soc/qcom,mss@4080000 >/dev/null

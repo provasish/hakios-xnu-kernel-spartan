@@ -23,7 +23,9 @@ In the repository:
   37f3812), which is published under the Apple Public Source License 2.0: the PCIe/MHI parts of wifi/lx (src/lx_pci.c,
   src/lx_mhi.c, src/mhi_host.[ch], src/lx_sae.[ch], include/crypto/hash.h, patches/include-linux-{mhi,pci}.h.patch, and
   its changes to the other files of wifi/lx), the PCI path of drivers/wifi/hakios.wifi.c and hakios.lx.c, and the
-  spartan radio's bus driver devices/spartan/drivers/wifi/hakios.spartan_wifi.c (from its instantnoodle_wifi.c). Those
+  spartan radio's bus driver devices/spartan/drivers/wifi/hakios.spartan_wifi.c (from its instantnoodle_wifi.c); and for
+  the modem, the MHI host drivers/modem/hakios.mhi.c with xnu/files/bsd/sys/hakios.mhi.h (its hk_mhi.c, hk_mhi.h) and
+  devices/spartan/drivers/modem/hakios.spartan_modem.c (its instantnoodle_modem.c). Those
   parts are under the APSL 2.0 (LICENSE.APSL), as their origin, whatever the directory they are in says; renamed to this
   tree's names, with spartan's own numbers where they differ.
 
