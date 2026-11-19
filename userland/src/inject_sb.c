@@ -381,8 +381,52 @@ struct block_layout {
 	void *isa;
 	int flags, reserved;
 	void (*invoke)(void *, ...);
+	struct {
+		unsigned long reserved, size;
+		const void *rest[3];    /* copy and dispose helpers if flags has 1 << 25, then the signature if it has 1 << 30 */
+	} *descriptor;
 };
 #define BLOCK_CALL(block, type, ...) ((type)((struct block_layout *)(block))->invoke)((block), __VA_ARGS__)
+
+/*
+ * A block's own type signature ("v24@?0@8@16": returns void, the block itself, two objects), or NULL if it carries none; and
+ * how many parameters it takes besides itself (-1: not known). spartan, 19 November: the service item's string setter was
+ * called with (data, string) and took the data for the string (-[STTelephonyStatusDomainData getCString:...], SpringBoard
+ * aborted in a loop) the first time the modem was registered: on Darwin userland 16.5 it takes the string alone.
+ */
+static const char *
+block_signature(void *block)
+{
+	const struct block_layout *b = block;
+
+	if (b == NULL || b->descriptor == NULL || !(b->flags & (1 << 30))) {
+		return NULL;
+	}
+	return (const char *)b->descriptor->rest[(b->flags & (1 << 25)) ? 2 : 0];
+}
+
+static int
+block_parameters(void *block)
+{
+	const char *s = block_signature(block);
+	int count = -1;
+
+	if (s == NULL) {
+		return -1;
+	}
+	/* each parameter is a type followed by its offset; the return type comes first and the block ("@?") is the first parameter */
+	for (const char *c = s; *c != 0;) {
+		if (*c >= '0' && *c <= '9') {
+			while (*c >= '0' && *c <= '9') {
+				c++;
+			}
+			count++;
+		} else {
+			c++;
+		}
+	}
+	return count - 1;
+}
 
 static void
 update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter, void *setter)
@@ -435,7 +479,21 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 		shown = 5;
 	}
 	if ((up > 0 || registered > 0) && shown > 0 && setter != NULL && data != NULL) {
-		BLOCK_CALL(setter, void (*)(void *, void *, int), data, shown);
+		static int said_signature;
+		int parameters = block_parameters(setter);
+
+		if (!said_signature++) {
+			say("hakios: cellular: the signal item's bars setter has signature \"%s\": %d parameter(s)\n",
+			    block_signature(setter) ? block_signature(setter) : "(none)", parameters);
+		}
+		/* (as the service item's setter: by the block's own signature, the bars alone or the data and the bars) */
+		if (parameters == 1) {
+			BLOCK_CALL(setter, void (*)(void *, int), shown);
+		} else if (parameters == 2) {
+			BLOCK_CALL(setter, void (*)(void *, void *, int), data, shown);
+		} else {
+			return;
+		}
 		((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 		if (shown != cellular_last_bars) {
 			say("hakios: cellular: %d bars shown (item %ld; kernel bars %d, %d dBm, registered %d)\n", shown, item, bars, dbm, registered);
@@ -474,7 +532,21 @@ update_service_item(id self, SEL sel, long item, void *data, id sim, id other, v
 		CFStringRef string = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 
 		if (string != NULL) {
-			BLOCK_CALL(s1, void (*)(void *, void *, CFStringRef), data, string);
+			static int said_signature;
+			int parameters = block_parameters(s1);
+
+			if (!said_signature++) {
+				say("hakios: cellular: the service item's string setter has signature \"%s\": %d parameter(s)\n",
+				    block_signature(s1) ? block_signature(s1) : "(none)", parameters);
+			}
+			if (parameters == 1) {
+				BLOCK_CALL(s1, void (*)(void *, CFStringRef), string);
+			} else if (parameters == 2) {
+				BLOCK_CALL(s1, void (*)(void *, void *, CFStringRef), data, string);
+			} else {
+				CFRelease(string);
+				return;         /* (a shape not known: the name is not shown, rather than SpringBoard taken down) */
+			}
 			((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
 			if (strcmp(shown, name) != 0) {
 				snprintf(shown, sizeof(shown), "%s", name);
