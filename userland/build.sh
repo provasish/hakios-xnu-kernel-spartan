@@ -137,7 +137,8 @@ INJECT=${INJECT-"/redwood/lib/libhakios.dylib backboardd containermanagerd conta
 /redwood/lib/libhakios.sb.dylib SpringBoard
 /redwood/lib/libhakios.media.dylib mediaserverd
 /redwood/lib/libhakios.app.dylib Sileo
-/redwood/lib/libhakios.tweaks.dylib Preferences"}
+/redwood/lib/libhakios.tweaks.dylib Preferences
+/redwood/lib/libhakios.statusbar.dylib SpringBoard @apps"}
 mkdir -p obj
 
 if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
@@ -246,6 +247,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 		# program either as the one library the kernel inserts or opened by a library of ours
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
 			-o obj/libhakios.tweaks.dylib src/inject_tweaks.c
+		# ... the status bar's clock moved clear of a camera hole in the top-left corner (src/inject_statusbar.c): in
+		# SpringBoard and every application, each of which draws its own status bar
+		$DYN -dynamiclib -install_name /redwood/lib/libhakios.statusbar.dylib -framework CoreFoundation -framework CoreGraphics -lobjc \
+			-o obj/libhakios.statusbar.dylib src/inject_statusbar.c
 		# ... and inside an application, to say what killed it (src/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
 			-o obj/libhakios.app.dylib src/inject_app.c
@@ -374,6 +379,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+	[ -f obj/libhakios.statusbar.dylib ] && cp obj/libhakios.statusbar.dylib root/lib/
 	if [ -f obj/HakiosAudio ]; then
 		mkdir -p root/lib/HakiosAudio.driver
 		cp obj/HakiosAudio root/lib/HakiosAudio.driver/
@@ -462,7 +468,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 	# the system image, so mkjobs.py judges "is this daemon's program there" by the listing of the volume
 	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
 	# fairplayd among them).
-	cp com.hakios.demo.plist com.hakios.wifi.plist root/LaunchDaemons/
+	cp com.hakios.demo.plist com.hakios.wifi.plist com.hakios.cell.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $DARWIN/rootfs.slt ] && VOLUME="--root-volume $DARWIN/rootfs.slt"
 	[ -n "$DARWIN_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $DARWIN/rootfs root/LaunchDaemons $DARWIN_JOBS

@@ -807,6 +807,136 @@ pushStop(void)
 	gPushed = 0;
 }
 
+/*
+ * Boot-arg fb_panel_hz=120 (with fb_push=1; 0, the default: the panel stays at the firmware's rate). ABL starts spartan's
+ * panel (Samsung AMS662ZS01, "oplus21623samsung_ams662zs01_1080_2400_cmd") at 60 Hz, and in command mode each push waits for
+ * the panel's TE, so frames can come no faster than 60 a second whatever fb_hz says (19 November: fb_hz=120, 17 ms frames).
+ * The panel's own switch, the live device tree's qcom,mdss-dsi-timing-switch-command (timing@0: 120 Hz, 60 08 00; timing@1:
+ * 60 Hz, 60 00 00; the same DSI clock for both, the 60 Hz mode only a wider horizontal front porch; state dsi_hs_mode): DCS
+ * long writes through DSI0's command DMA, as the OnePlus 8 Pro port does it (Linux dsi_ctrl_hw_cmn.c: registers 4 bytes in
+ * on 6G). The DMA reads through the display's SMMU, which maps cont_splash_region (0x9c000000..0x9e300000) as the firmware
+ * left it: the packets go in its page at 0x9c9ff000, past the framebuffer even at the GPU's pitch (it ends at 0x9c9f6000).
+ */
+static TUNABLE(uint32_t, gPanelHz, "fb_panel_hz", 0);
+#define DSI0_PHYS               0x0ae94000
+#define DSI_REG(offset)         ((offset) + 4)
+#define DSI_CTRL                DSI_REG(0x000)
+#define DSI_CMD_DMA_CTRL        DSI_REG(0x038)
+#define DSI_CMD_DMA_LOW_POWER   (1u << 26)
+#define DSI_DMA_BASE            DSI_REG(0x044)
+#define DSI_DMA_LEN             DSI_REG(0x048)
+#define DSI_TRIG_CTRL           DSI_REG(0x080)
+#define DSI_TRIG_DMA            DSI_REG(0x08c)
+#define DSI_INTR_CTRL           DSI_REG(0x10c)
+#define DSI_CMD_DMA_DONE        (1u << 0)
+#define DSI_DMA_PHYS            0x9c9ff000ull
+#define INTF1_TE_COUNT          0x6ba98                 /* [31:16] TE pulses seen (INTF_TEAR_INT_COUNT_VAL) */
+
+/* Each command: milliseconds to wait after it, length, bytes (all DCS long writes); 0 length ends. */
+static const uint8_t kSpartan120Hz[] = {
+	0, 3, 0xf0, 0x5a, 0x5a,
+	0, 3, 0x60, 0x08, 0x00,
+	0, 2, 0xf7, 0x0f,
+	0, 3, 0xf0, 0xa5, 0xa5,
+	0, 0,
+};
+static const uint8_t kSpartan60Hz[] = {
+	0, 3, 0xf0, 0x5a, 0x5a,
+	0, 3, 0x60, 0x00, 0x00,
+	0, 2, 0xf7, 0x0f,
+	17, 3, 0xf0, 0xa5, 0xa5,
+	0, 0,
+};
+static vm_offset_t gDSI, gDsiDma;
+static uint32_t gTeVsync;               /* INTF1's tear-check vsync as the firmware left it; 0: not changed */
+static unsigned gPanelRate;             /* what the panel was switched to; 0: left as the firmware had it */
+
+static unsigned
+teRate(void)
+{
+	uint32_t before = displayReg(gDPU, INTF1_TE_COUNT) >> 16;
+
+	IODelay(100000);
+	return (((displayReg(gDPU, INTF1_TE_COUNT) >> 16) - before) & 0xffff) * 10;
+}
+
+/* One DCS long write through DSI0's command DMA. false: the DMA did not say done in 20 ms. */
+static bool
+dsiLongWrite(const uint8_t * bytes, unsigned n)
+{
+	volatile uint8_t * buffer = (volatile uint8_t *) gDsiDma;
+	unsigned length = (4 + n + 3) & ~3u, waited;
+
+	buffer[0] = (uint8_t) n;                /* MSM order: word count, then the data type; last packet, long */
+	buffer[1] = 0;
+	buffer[2] = 0x39;
+	buffer[3] = 0xc0;
+	for (unsigned i = 0; i < length - 4; i++) {
+		buffer[4 + i] = i < n ? bytes[i] : 0xff;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(gDSI + DSI_INTR_CTRL) = displayReg(gDSI, DSI_INTR_CTRL);
+	*(volatile uint32_t *)(gDSI + DSI_DMA_BASE) = (uint32_t) DSI_DMA_PHYS;
+	*(volatile uint32_t *)(gDSI + DSI_DMA_LEN) = length;
+	*(volatile uint32_t *)(gDSI + DSI_TRIG_DMA) = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	for (waited = 0; waited < 2000 && !(displayReg(gDSI, DSI_INTR_CTRL) & DSI_CMD_DMA_DONE); waited++) {
+		IODelay(10);
+	}
+	*(volatile uint32_t *)(gDSI + DSI_INTR_CTRL) = displayReg(gDSI, DSI_INTR_CTRL);
+	return waited < 2000;
+}
+
+/* No transfer in flight (autorefresh off, nothing pushed yet, or the loader taking the display back): the panel to `hz`. */
+static void
+panelRate(unsigned hz)
+{
+	if (gDSI == 0) {
+		gDSI = ml_io_map(DSI0_PHYS, 0x1000);
+		gDsiDma = ml_io_map((vm_offset_t) DSI_DMA_PHYS, 0x1000);
+	}
+	if (gDSI == 0 || gDsiDma == 0) {
+		return;
+	}
+	uint32_t ctrl = displayReg(gDSI, DSI_CTRL), trig = displayReg(gDSI, DSI_TRIG_CTRL), dma = displayReg(gDSI, DSI_CMD_DMA_CTRL);
+	uint32_t vsync = displayReg(gDPU, INTF1_TE_VSYNC), count = vsync & 0x7ffff;
+	unsigned before = teRate(), sent = 0, total = 0;
+
+	if (!(ctrl & 1) || !(ctrl & (1u << 2)) || (trig & 7) != 4) {
+		displayLog("display: DSI0 not in command mode with software-triggered DMA (ctrl %#x trig %#x); the panel stays at %u Hz\n",
+		    ctrl, trig, before);
+		return;
+	}
+	if (before + 10 > hz && before < hz + 10) {
+		/* (already: 19 November, the panel's TE came at 120 before anything was sent -- Android had left it there) */
+		displayLog("display: the panel's TE already %u a second: nothing sent for %u Hz\n", before, hz);
+		return;
+	}
+	if (hz > 60 && gTeVsync == 0) {
+		gTeVsync = vsync;
+		displayWrite(INTF1_TE_VSYNC, (vsync & ~0x7ffffu) | (count * 60 / hz));
+	}
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma & ~DSI_CMD_DMA_LOW_POWER;     /* "dsi_hs_mode" */
+	for (const uint8_t * c = hz > 60 ? kSpartan120Hz : kSpartan60Hz; c[1] != 0; c += 2 + c[1]) {
+		total++;
+		if (!dsiLongWrite(c + 2, c[1])) {
+			break;
+		}
+		sent++;
+		if (c[0] != 0) {
+			IODelay(c[0] * 1000);
+		}
+	}
+	*(volatile uint32_t *)(gDSI + DSI_CMD_DMA_CTRL) = dma;
+	if (hz <= 60 && gTeVsync != 0) {
+		displayWrite(INTF1_TE_VSYNC, gTeVsync);
+		gTeVsync = 0;
+	}
+	gPanelRate = hz;
+	displayLog("display: the panel to %u Hz: %u of %u commands sent (ctrl %#x trig %#x dma %#x); TE %u a second before, %u after\n",
+	    hz, sent, total, ctrl, trig, dma, before, teRate());
+}
+
 /* Autorefresh off, once its frame in flight is out: from now on the panel gets a frame only when one is pushed. */
 static bool
 pushStart(unsigned height)
@@ -847,6 +977,9 @@ pushStart(unsigned height)
 	gPushing = true;
 	displayLog("display: autorefresh %#x off after %u us; each frame is pushed through CTL0 on the panel's TE (polled)\n",
 	    gAutorefresh, waited * 100);
+	if (gPanelHz > 60 && gPanelHz <= 120) {
+		panelRate(gPanelHz);
+	}
 	return true;
 }
 
@@ -964,6 +1097,30 @@ static uint64_t gPanelSince;            /* when it was taken (a window server th
 static uint32_t gStride0;               /* VIG0's SRC_YSTRIDE0 as the firmware left it; 0: not changed */
 static uint32_t gPanelRowBytes;
 static uint32_t gPanelPushed, gPanelCopied; /* frames pushed as the GPU drew them, copied here: for the log */
+/*
+ * Boot-arg fb_double=1: two panel buffers. With one, the next frame could not be drawn until the push before was out of
+ * it -- the panel's TE, then the sending -- so a frame took its drawing and that wait, about 15 ms: 60 frames a second on a
+ * panel at 120 (19 November, touch_lat=1: frames drawn in 6.5 ms came 8.3 ms apart, the rest 16.7). The second buffer is
+ * at DOUBLE_PHYS in cont_splash_region (0x9c000000, 0x2300000 long; the display's SMMU maps it on the OnePlus 8 Pro, the
+ * same SoC and firmware), and gPanel is always the one NOT being sent (the back buffer): each push points VIG0 at it, then
+ * the two change places. The GPU draws the next frame while this one goes out.
+ */
+static TUNABLE(uint32_t, gDoubleBuffer, "fb_double", 0);
+#define DOUBLE_PHYS             0x9ca00000ull
+#define SPLASH_END              0x9e300000ull
+static MiniIOSurface * gPanels[2];
+static uint64_t gPanelPhys[2];
+static unsigned gBack;                  /* gPanels[gBack] == gPanel (gPanelLock); only with two */
+
+/* After a push of the back buffer (gPanelLock held): the other one is the back buffer now. */
+static void
+panelFlip(void)
+{
+	if (gPanels[1] != NULL) {
+		gBack ^= 1;
+		gPanel = gPanels[gBack];
+	}
+}
 
 /* Is a push still reading the panel's memory? */
 static bool
@@ -978,6 +1135,15 @@ panelGiveBack(void)
 {
 	if (gStride0 == 0 || gPanel == NULL) {
 		return;
+	}
+	if (gPanels[1] != NULL) {
+		/* (the frame last sent is in the front buffer: into the boot framebuffer first, if that is the second one) */
+		if (gBack == 0) {
+			memcpy((void *) gPanels[0]->kpixels, (const void *) gPanels[1]->kpixels, (size_t) gPanelRowBytes * vinfo.v_height);
+		}
+		gBack = 0;
+		gPanel = gPanels[0];
+		displayWrite(VIG0_SRC0_ADDR, (uint32_t) gPanelPhys[0]);
 	}
 	volatile uint8_t * base = gPanel->kpixels;
 
@@ -1009,9 +1175,21 @@ panelTake(uint32_t width, uint32_t height)
 	gStride0 = stride;
 	gPanelRowBytes = rowBytes;
 	displayWrite(VIG0_SRC_YSTRIDE0, (stride & ~0xffffu) | rowBytes);        /* (latched by the next push) */
+	gPanels[0] = gPanel;
+	gPanelPhys[0] = vinfo.v_physaddr;
+	if (gDoubleBuffer && vinfo.v_physaddr + (uint64_t) rowBytes * height <= DOUBLE_PHYS &&
+	    DOUBLE_PHYS + (uint64_t) rowBytes * height <= SPLASH_END &&
+	    (gPanels[1] = MiniIOSurfaceCreateScanout(DOUBLE_PHYS, width, height, rowBytes)) != NULL) {
+		gPanelPhys[1] = DOUBLE_PHYS;
+		memcpy((void *) gPanels[1]->kpixels, (const void *) gPanels[0]->kpixels, (size_t) rowBytes * height);
+		gBack = 1;                      /* (VIG0 reads the boot framebuffer: the first frame goes into the other) */
+		gPanel = gPanels[1];
+		displayLog("display: a second panel buffer at %#llx, surface %u: frames are drawn into one while the other is sent\n",
+		    DOUBLE_PHYS, gPanels[1]->sid);
+	}
 	gPanelState = kPanelFree;
 	displayLog("display: the panel's memory %#llx is surface %u for the GPU to draw frames into (rows of %u bytes, VIG0 had %#x)\n",
-	    (uint64_t) vinfo.v_physaddr, gPanel->sid, rowBytes, stride);
+	    (uint64_t) vinfo.v_physaddr, gPanels[0]->sid, rowBytes, stride);
 	return true;
 }
 
@@ -1032,7 +1210,7 @@ panelAcquire(task_t task, uint64_t * out)
 	 * half one, half the other -- the glitches seen while swiping (19 November). A ready frame no swap came for in
 	 * 100 ms is given up.
 	 */
-	while (gPanelState == kPanelCopying || gPanelState == kPanelDrawing || pushInFlight() ||
+	while (gPanelState == kPanelCopying || gPanelState == kPanelDrawing || (gPanels[1] == NULL && pushInFlight()) ||
 	    (gPanelState == kPanelReady && mach_absolute_time() - gPanelSince < stale)) {
 		if (mach_absolute_time() >= deadline) {
 			IOLockUnlock(gPanelLock);
@@ -1084,6 +1262,9 @@ hakios_display_quiesce(void)
 	}
 	for (unsigned i = 0; i < PUSH_TIMEOUT_MS * 10 && gPushed != 0 && !(displayReg(gDPU, MDP_INTR_STATUS) & MDP_INTR_PP0_DONE); i++) {
 		IODelay(100);
+	}
+	if (gPanelRate > 60) {
+		panelRate(60);          /* (the firmware's rate back for whatever takes the panel next) */
 	}
 	pushStop();
 }
@@ -1998,6 +2179,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		fStatBeatWait += mach_absolute_time() - began;
 		began = mach_absolute_time();
 	}
+	if (gPushing && gPanel != NULL && gPanels[1] != NULL) {
+		fBase = gPanel->kpixels;        /* (fb_double: a frame copied here goes into the back buffer too) */
+	}
 	if (gPushing && gPanel != NULL) {
 		/*
 		 * fb_gpu: has the GPU drawn this very frame into the panel's memory? Only a swap of one whole-screen layer, whose
@@ -2161,13 +2345,18 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	if (gPushing) {
+		if (gPanels[1] != NULL) {
+			displayWrite(VIG0_SRC0_ADDR, (uint32_t) gPanelPhys[gBack]);    /* (latched by the push's flush) */
+		}
 		pushFrame();
 		if (gPanel != NULL) {
 			IOLockLock(gPanelLock);
 			gPanelState = kPanelFree;       /* (the GPU gets it again once this push is out: panelAcquire()) */
+			panelFlip();                    /* (fb_double: or the other one at once) */
 			IOLockUnlock(gPanelLock);
 			if ((gPanelPushed + gPanelCopied) % 600 == 1) {
-				displayLog("display: frames pushed as the GPU drew them %u, copied here %u\n", gPanelPushed, gPanelCopied);
+				displayLog("display: frames pushed as the GPU drew them %u, copied here %u; %u panel buffer%s (fb_double %u)\n",
+				    gPanelPushed, gPanelCopied, gPanels[1] != NULL ? 2 : 1, gPanels[1] != NULL ? "s" : "", gDoubleBuffer);
 			}
 		}
 	}

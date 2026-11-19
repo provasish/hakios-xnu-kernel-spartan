@@ -7,6 +7,8 @@
  *   store [PATTERN]       what configd has in its dynamic store (default: everything under
  *                         State:/Network and Setup:/Network)
  *   dhcp IF               ask configd's IPConfiguration plugin to configure IF by DHCP
+ *   auto6 IF              ... to configure IF's IPv6 from router advertisements (the modem's en1: see auto6())
+ *   cell                  what the job com.hakios.cell runs: with modem_data=N, wait for en1 and auto6 it
  *   waitaddr IF SECONDS   wait until IF has an IPv4 address
  *   resolve NAME          getaddrinfo(): the question goes to mDNSResponder, which asks the
  *                         servers configd has told it about
@@ -188,12 +190,13 @@ struct set_reply {
 };
 #pragma pack(pop)
 
-static void
-dhcp(const char *interface)
+/* "setservice IF <method>": the plugin's answer, 0 when done (the statuses below), -1 when the message did not get there */
+static int
+set_service(const char *interface, NSDictionary *plist, const char *what)
 {
 	static const char *const statuses[] = { "done", "permission denied", "no such interface", "invalid parameter",
 		                                "invalid operation", "allocation failed", "internal error", "not supported" };
-	NSData *method = [NSPropertyListSerialization dataWithPropertyList:@{ @"ConfigMethod": @"DHCP" }
+	NSData *method = [NSPropertyListSerialization dataWithPropertyList:plist
 	    format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
 	mach_port_t server = MACH_PORT_NULL, reply_port = mig_get_reply_port();
 	union {
@@ -204,8 +207,8 @@ dhcp(const char *interface)
 
 	result = bootstrap_look_up(bootstrap_port, "com.apple.network.IPConfiguration", &server);
 	if (result != KERN_SUCCESS) {
-		printf("net_test: dhcp: configd's IPConfiguration is not there: %#x\n", result);
-		return;
+		printf("net_test: %s: configd's IPConfiguration is not there: %#x\n", what, result);
+		return -1;
 	}
 	memset(&message, 0, sizeof(message));
 	message.request.head.msgh_bits = MACH_MSGH_BITS_COMPLEX | MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
@@ -225,16 +228,42 @@ dhcp(const char *interface)
 	result = mach_msg(&message.request.head, MACH_SEND_MSG | MACH_RCV_MSG, sizeof(message.request), sizeof(message), reply_port,
 	    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
 	if (result != KERN_SUCCESS) {
-		printf("net_test: dhcp: the message did not go through: %#x\n", result);
+		printf("net_test: %s: the message did not go through: %#x\n", what, result);
+		return -1;
 	} else if (message.reply.result != KERN_SUCCESS) {
-		printf("net_test: dhcp: IPConfiguration does not take the message: %d\n", message.reply.result);
+		printf("net_test: %s: IPConfiguration does not take the message: %d\n", what, message.reply.result);
+		return -1;
 	} else {
 		int status = message.reply.status;
 
 		message.reply.service[sizeof(message.reply.service) - 1] = 0;
-		printf("net_test: dhcp: IPConfiguration says of \"setservice %s DHCP\": %d (%s), service %s\n", interface, status,
+		printf("net_test: %s: IPConfiguration says of \"setservice %s\": %d (%s), service %s\n", what, interface, status,
 		    status >= 0 && status < 8 ? statuses[status] : "?", message.reply.service);
+		return status;
 	}
+}
+
+static void
+dhcp(const char *interface)
+{
+	set_service(interface, @{ @"ConfigMethod": @"DHCP" }, "dhcp");
+}
+
+/*
+ * auto6 IF: IPv6 configured from the router's advertisements on IF -- the modem's en1, whose IPv6-only session (Jio)
+ * the kernel's driver plays the router for (hakios.spartan_modem.c, "IPv6 on en1"). The same request as dhcp, with
+ * an IPv6 method: first as an IPv6 entity, then (if the plugin says the parameter is not one it takes) plain.
+ */
+static void
+auto6(const char *interface)
+{
+	if (set_service(interface, @{ @"IPv6": @{ @"ConfigMethod": @"Automatic" } }, "auto6 (IPv6 entity, Automatic)") == 0) {
+		return;
+	}
+	if (set_service(interface, @{ @"ConfigMethod": @"Automatic" }, "auto6 (Automatic)") == 0) {
+		return;
+	}
+	set_service(interface, @{ @"ConfigMethod": @"RTADV" }, "auto6 (RTADV)");
 }
 
 /* ---- resolve, tcp ---------------------------------------------------------------------------------- */
@@ -368,6 +397,41 @@ reach(const char *name)
 	if (target != NULL) {
 		CFRelease(target);
 	}
+}
+
+/*
+ * cell: with modem_data=N (N not 0) among the kernel's arguments, wait for en1 -- the modem's mobile data
+ * (devices/spartan/drivers/modem/hakios.spartan_modem.c), which comes some 30 s after the modem's mission, itself
+ * some 30 s after the start -- and have configd configure its IPv6 from the router advertisements the kernel's driver
+ * sends (auto6). On an iPhone CommCenter asks for that; there is none here. Seen on spartan (19 November, Jio,
+ * IPv6-only): en1 up with its global addresses and 464XLAT's 192.0.0.2, a name resolved, an https page fetched.
+ */
+static void
+cell(void)
+{
+	char arguments[1024] = "";
+	size_t size = sizeof(arguments) - 1;
+	double start = seconds();
+	bool wanted = false, there = false;
+
+	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) != 0) {
+		return;
+	}
+	for (const char *word = strtok(arguments, " "); word != NULL; word = strtok(NULL, " ")) {
+		wanted |= strncmp(word, "modem_data=", 11) == 0 && strcmp(word, "modem_data=0") != 0;
+	}
+	if (!wanted) {
+		return;
+	}
+	while (!(there = if_nametoindex("en1") != 0) && seconds() - start < 300) {
+		usleep(500000);
+	}
+	if (!there) {
+		printf("net_test: cell: no en1 after %.0f s: the modem's data session has not come up\n", seconds() - start);
+		return;
+	}
+	printf("net_test: cell: en1 is there after %.1f s: its IPv6 configured from the router's advertisements\n", seconds() - start);
+	auto6("en1");
 }
 
 /*
@@ -559,6 +623,8 @@ main(int argc, char **argv)
 				store(i + 1 < argc && strchr(argv[i + 1], ':') != NULL ? argv[++i] : NULL);
 			} else if (strcmp(step, "dhcp") == 0 && i + 1 < argc) {
 				dhcp(argv[++i]);
+			} else if (strcmp(step, "auto6") == 0 && i + 1 < argc) {
+				auto6(argv[++i]);
 			} else if (strcmp(step, "waitaddr") == 0 && i + 2 < argc) {
 				const char *interface = argv[++i];
 				double start = seconds(), limit = atof(argv[++i]);
@@ -582,6 +648,8 @@ main(int argc, char **argv)
 				usleep((useconds_t)(atof(argv[++i]) * 1e6));
 			} else if (strcmp(step, "wifi") == 0) {
 				wifi();
+			} else if (strcmp(step, "cell") == 0) {
+				cell();
 			} else if (strcmp(step, "watch") == 0 && i + 1 < argc) {
 				watch(atof(argv[++i]));
 			} else if (strcmp(step, "wrongjoin") == 0) {

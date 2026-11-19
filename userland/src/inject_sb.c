@@ -444,6 +444,14 @@ update_signal_item(id self, SEL sel, long item, void *data, id sim, void *getter
 		    item, data, (void *)sim, getter, setter, up, registered, bars, dbm);
 	}
 	/*
+	 * One modem, one SIM: the item asked with no SIM info is the second slot's (spartan has two; the kernel's modem state is
+	 * the first's). Turned on as well, it made the bar draw two dim rows of dual-SIM bars (19 November): it is left as Darwin
+	 * has it -- off.
+	 */
+	if (sim == nil) {
+		return;
+	}
+	/*
 	 * Force the signal item on. Darwin hides it unless its own cellular stack (CommCenter, which is
 	 * not here) says there is service, so the bars never appear on their own. The kernel knows
 	 * the modem's state, so once it is up the item is shown here with the kernel's bars; when the
@@ -528,7 +536,8 @@ update_service_item(id self, SEL sel, long item, void *data, id sim, id other, v
 		say("hakios: cellular: service item %ld: data %p, SIM info %p, other %p; string getter %p setter %p, content type getter %p "
 		    "setter %p; the kernel's network \"%s\"\n", item, data, (void *)sim, (void *)other, g1, s1, g3, s3, name);
 	}
-	if (registered > 0 && name[0] != 0 && s1 != NULL && data != NULL) {
+	/* (the second slot's item, with no SIM info, stays as Darwin has it: see update_signal_item()) */
+	if (registered > 0 && name[0] != 0 && s1 != NULL && data != NULL && sim != nil) {
 		CFStringRef string = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 
 		if (string != NULL) {
@@ -555,6 +564,71 @@ update_service_item(id self, SEL sel, long item, void *data, id sim, id other, v
 			CFRelease(string);
 		}
 	}
+}
+
+/*
+ * The data network item ("4G", "LTE", or the Wi-Fi fan): filled by CommCenter's data context, which
+ * is not here, so with mobile data up (sysctl kern.hakios.cellular_data, the modem's QMI data
+ * session) it said nothing. Once the kernel's modem has data and the item is not showing Wi-Fi,
+ * its type is set to 4G (SpringBoard's raw data: 0 GPRS, 1 EDGE, 2 3G, 3 4G, 4 LTE, 5 Wi-Fi) and
+ * the item switched on.
+ */
+#define DATA_TYPE_4G    3
+#define DATA_TYPE_WIFI  5
+
+static void (*original_update_data_item)(id self, SEL sel, long item, void *data, BOOL primary, void *getter, void *setter);
+static id data_aggregator;
+
+static void
+update_data_item(id self, SEL sel, long item, void *data, BOOL primary, void *getter, void *setter)
+{
+	static int said, said_shown;
+	int registered = sysctl_int("kern.hakios.cellular_registered"), mobile = sysctl_int("kern.hakios.cellular_data");
+	int now = -1, gp = block_parameters(getter), sp = block_parameters(setter);
+
+	data_aggregator = self;
+	if (original_update_data_item) {
+		original_update_data_item(self, sel, item, data, primary, getter, setter);
+	}
+	if (getter != NULL && (gp == 0 || gp == 1)) {
+		now = gp == 0 ? ((int (*)(void *))((struct block_layout *)getter)->invoke)(getter) :
+		    ((int (*)(void *, void *))((struct block_layout *)getter)->invoke)(getter, data);
+	}
+	if (said++ < 6) {
+		say("hakios: cellular: data network item %ld: primary %d, data %p, type now %d; getter \"%s\" setter \"%s\"; the kernel says "
+		    "registered %d data %d\n", item, primary, data, now, block_signature(getter) ? block_signature(getter) : "(none)",
+		    block_signature(setter) ? block_signature(setter) : "(none)", registered, mobile);
+	}
+	if (!primary || registered <= 0 || mobile <= 0 || now == DATA_TYPE_WIFI || setter == NULL || data == NULL) {
+		return;
+	}
+	if (sp == 1) {
+		BLOCK_CALL(setter, void (*)(void *, int), DATA_TYPE_4G);
+	} else if (sp == 2) {
+		BLOCK_CALL(setter, void (*)(void *, void *, int), data, DATA_TYPE_4G);
+	} else {
+		return;
+	}
+	((void (*)(id, SEL, long, BOOL))objc_msgSend)(self, sel_registerName("_setItem:enabled:"), item, YES);
+	if (!said_shown++) {
+		say("hakios: cellular: 4G shown (data network item %ld, was %d)\n", item, now);
+	}
+}
+
+static void
+data_item_hook(void)
+{
+	const char *selector = "_updateDataNetworkItem:withData:primary:dataNetworkTypeGetter:dataNetworkTypeSetter:";
+	Class cls = objc_getClass("SBStatusBarStateAggregator");
+	Method method = cls ? class_getInstanceMethod(cls, sel_registerName(selector)) : NULL;
+
+	if (method == NULL) {
+		say("hakios: cellular: no -[SBStatusBarStateAggregator %s]\n", selector);
+		return;
+	}
+	say("hakios: cellular: -[SBStatusBarStateAggregator %s] types \"%s\": replaced\n", selector, method_getTypeEncoding(method));
+	original_update_data_item = (void (*)(id, SEL, long, void *, BOOL, void *, void *))method_getImplementation(method);
+	method_setImplementation(method, (IMP)update_data_item);
 }
 
 /*
@@ -610,6 +684,7 @@ static void
 cellular_hook(void)
 {
 	signal_view_hook();
+	data_item_hook();
 	{
 		const char *service_selector = "_updateServiceItem:withData:SIMInfo:otherSIMInfo:serviceStringGetter:serviceStringSetter:"
 		    "serviceCrossfadeStringGetter:serviceCrossfadeStringSetter:serviceContentTypeGetter:serviceContentTypeSetter:"
@@ -668,8 +743,19 @@ cellular_hook(void)
 
 	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
 	dispatch_source_set_event_handler(timer, ^{
-		static int last_registered = -2, last_bars = -2;
+		static int last_registered = -2, last_bars = -2, last_mobile = -2;
 		int registered = sysctl_int("kern.hakios.cellular_registered"), bars = sysctl_int("kern.hakios.cellular_bars");
+		int mobile = sysctl_int("kern.hakios.cellular_data");
+
+		if ((registered != last_registered || mobile != last_mobile) && (data_aggregator ?: cellular_aggregator) != nil) {
+			SEL update = sel_registerName("_updateDataNetworkItem");
+
+			last_mobile = mobile;
+			if (class_getInstanceMethod(object_getClass(data_aggregator ?: cellular_aggregator), update)) {
+				((void (*)(id, SEL))objc_msgSend)(data_aggregator ?: cellular_aggregator, update);
+				say("hakios: cellular: the data network item asked to update (registered %d, data %d)\n", registered, mobile);
+			}
+		}
 
 		if ((registered != last_registered || bars != last_bars) && cellular_aggregator != nil) {
 			SEL update = sel_registerName("_updateSignalStrengthItem");

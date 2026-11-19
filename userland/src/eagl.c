@@ -249,8 +249,8 @@ struct eagl {
 	id object;                      /* the EAGLContext */
 	struct hakios_gl *gl;
 	unsigned long api;
-	struct image images[256];
-	unsigned image_count;
+	struct image *images;           /* (grows: the window server keeps a texture for every IOSurface of every app on screen) */
+	unsigned image_count, image_room;
 	GLuint framebuffer;             /* the one bound */
 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
@@ -534,9 +534,19 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
 	struct image *image = image_of(e, texture);
 
 	if (image == NULL) {
-		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
-			say("hakios-gl: more textures with IOSurfaces than there is room for\n");
-			return NULL;
+		if (e->image_count == e->image_room) {
+			unsigned room = e->image_room != 0 ? e->image_room * 2 : 256;
+			struct image *grown = room <= 16384 ? realloc(e->images, room * sizeof(*grown)) : NULL;
+
+			if (grown == NULL) {
+				say("hakios-gl: more textures with IOSurfaces than there is room for (%u)\n", e->image_count);
+				return NULL;
+			}
+			e->images = grown;
+			e->image_room = room;
+			if (room > 256) {
+				say("hakios-gl: room for %u textures with IOSurfaces now\n", room);
+			}
 		}
 		image = &e->images[e->image_count++];
 	} else {
@@ -912,6 +922,31 @@ panel_draw(struct eagl *e, struct image *image)
 		return false;
 	}
 	panel_not_ready = 0;
+	/*
+	 * Two panel buffers (the driver's fb_double=1) come in turn: each keeps its own texture, so that neither is made again
+	 * every frame. panel_texture/panel_surface are the one in use now.
+	 */
+	{
+		static GLuint other_texture;
+		static uint32_t other_surface;
+
+		if (out[1] != panel_surface && out[1] == other_surface && other_texture != 0) {
+			GLuint t = panel_texture;
+			uint32_t s = panel_surface;
+
+			panel_texture = other_texture;
+			panel_surface = other_surface;
+			other_texture = t;
+			other_surface = s;
+		} else if (out[1] != panel_surface && panel_texture != 0 && panel_surface != 0) {
+			if (other_texture != 0) {
+				glDeleteTextures(1, &other_texture);
+			}
+			other_texture = panel_texture;          /* (kept for when that surface comes round again) */
+			other_surface = panel_surface;
+			panel_texture = 0;
+		}
+	}
 	if (out[1] != panel_surface || panel_texture == 0) {
 		glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
 		if (panel_texture == 0) {
@@ -4313,6 +4348,7 @@ my_dealloc(id self, SEL selector)
 			current = NULL;
 		}
 		hakios_gl_destroy(e->gl);
+		free(e->images);
 		free(e);
 	}
 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
