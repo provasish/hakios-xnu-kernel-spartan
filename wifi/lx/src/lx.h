@@ -24,5 +24,7 @@ int	lx_pci_probe(void);		/* lx_pci.c: the device behind the host bridge given to
 void	lx_pci_remove(void);		/* lx_pci.c: ... and taken from it */
 void	*lx_pci_driver(void);		/* lx_pci.c: what the driver made of it (its struct ath11k_base); NULL: none */
 void	lx_pci_resumed(void);		/* lx_pci.c: the device has its power back: what the driver wrote to it, again */
+struct ieee80211_hw;
+void	lx_set_country(struct ieee80211_hw *hw, const char alpha2[2]);	/* lx_bus.c: the radio's country, told its firmware */
 
 #endif

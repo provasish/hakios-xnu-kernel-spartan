@@ -83,6 +83,8 @@ void	 lx_os_qrtr_input(const void *data, unsigned long length);
 void	 lx_os_qrtr_attach(int (*send)(const void *data, unsigned long length));
 /* the radio's own address (six bytes), if the machine has one for it: 1, or 0 and nothing written */
 int	 lx_os_radio_address(unsigned char *address);
+/* The country the radio is in (boot-arg wifi_country, two letters): 1 and the letters, or 0: the firmware's own default. */
+int	 lx_os_country(char alpha2[2]);
 /*
  * The network the radio is to join, if the machine was given one: its name and its passphrase,
  * into buffers whose sizes come in and whose contents' lengths go out. 1, or 0.

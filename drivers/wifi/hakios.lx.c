@@ -304,6 +304,24 @@ lx_os_qrtr_attach(int (*send)(const void *data, unsigned long length))
 	hakios_wifi_qrtr_carrier(send);
 }
 
+/*
+ * Boot-arg wifi_country=XX: the country the radio is in, two letters (ISO 3166-1), told to its firmware once it is
+ * started, which then gives that country's channels and powers. Without it the firmware's own default holds ("US").
+ */
+int
+lx_os_country(char alpha2[2])
+{
+	char text[8] = "";
+
+	if (!PE_parse_boot_argn("wifi_country", text, sizeof(text)) || strlen(text) != 2 ||
+	    text[0] < 'A' || text[0] > 'Z' || text[1] < 'A' || text[1] > 'Z') {
+		return 0;
+	}
+	alpha2[0] = text[0];
+	alpha2[1] = text[1];
+	return 1;
+}
+
 int
 lx_os_radio_address(unsigned char *address)
 {

@@ -497,8 +497,11 @@ if [ -f ../fw-wifi/amss.bin ] && [ ! -f ../fw-wifi/wpss.mdt ]; then
 	for f in bdwlan.elf regdb.bin; do
 		[ -f ../fw-wifi/qca6390/$f ] && install -m 0644 ../fw-wifi/qca6390/$f root/fw/
 	done
-	rm -f root/fw/network
+	# the radio's own address, one line (Android's wifi_sta_factory_mac_address; the radio itself has none): the
+	# kernel's when no wifi_mac= is given. The phone's, so not in the repository, and left out with SHARE=1
+	rm -f root/fw/network root/fw/mac
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
+	if [ -z "$SHARE" ] && [ -f ../fw-wifi/mac ]; then install -m 0600 ../fw-wifi/mac root/fw/mac; fi
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (drivers/haptic/hakios.haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)

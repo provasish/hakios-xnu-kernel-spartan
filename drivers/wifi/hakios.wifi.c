@@ -4143,8 +4143,22 @@ hakios_wifi_radio_address(uint8_t *address)
 	bool good;
 
 	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
-		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\n", step);
-		return false;
+		/*
+		 * fw/mac of the small image, the same text on one line (userland/build.sh takes fw-wifi/mac, which is in no
+		 * repository): not on the command line, which the loader echoes. After the OnePlus 8 port's hk_wifi.c.
+		 */
+		uint64_t size = 0;
+		const uint8_t *file = image_file("mac", &size);
+		unsigned n = 0;
+
+		for (; file != NULL && n < size && n + 1 < sizeof(text) && file[n] != '\n' && file[n] != '\r'; n++) {
+			text[n] = (char)file[n];
+		}
+		text[n] = 0;
+		if (text[0] == 0) {
+			printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac, fw/mac)\n", step);
+			return false;
+		}
 	}
 	good = true;
 	for (const char *c = text;; c++) {

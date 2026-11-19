@@ -1407,6 +1407,14 @@ station_up(struct lx_radio *radio)
 	}
 	mutex_unlock(&hw->wiphy->mtx);
 	if (ret == 0) {
+		char country[2];
+
+		/* the country the radio is in, if the kernel was told (boot-arg wifi_country): the firmware's own default is "US" */
+		if (lx_os_country(country)) {
+			lx_set_country(hw, country);
+		}
+	}
+	if (ret == 0) {
 		lx_os_net_address(vif->addr);
 	}
 	return (-ret);

@@ -294,6 +294,7 @@ WIFI_AGAIN	arg	wifi_again	Wi-Fi	k	hakios.wifi.c	start the DSP although the one b
 WIFI_ASK	arg	wifi_ask	Wi-Fi	k	hakios.wifi.c	step 14 also asks that service a question (its capabilities) and writes down the beginning of an answer
 WIFI_BA	arg	wifi_ba	Wi-Fi	k	lx_80211.c	
 WIFI_CAL	arg	wifi_cal	Wi-Fi	k	hakios.wlfw.c	
+WIFI_COUNTRY	arg	wifi_country	Wi-Fi	k	hakios.lx.c	the country the radio is in, two letters (ISO 3166-1), told to its firmware once it is started, which then gives that country's channels and powers
 WIFI_DIRTY	arg	wifi_dirty	Wi-Fi	k	hakios.wifi.c	
 WIFI_FILE	arg	wifi_file	Wi-Fi	k	hakios.wifi.c	with wifi=1: the network of fw/network is not joined at the start
 WIFI_FINE	arg	wifi_fine	Wi-Fi	k	hakios.wifi.c	such a step waits like that before every single write and call

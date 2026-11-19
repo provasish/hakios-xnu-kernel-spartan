@@ -44,6 +44,9 @@
 #include "htc.h"
 #include "pcic.h"
 #include "qmi.h"
+#include "mac.h"
+#include "reg.h"
+#include "wmi.h"
 
 #include <lx_os.h>
 #include "lx.h"
@@ -1017,4 +1020,35 @@ lx_resume(void)
 	lx_tell("lx: resume: the firmware runs again, the driver is set up on it: %llu ms\n", (lx_os_nanoseconds() - began) /
 	    1000000ull);
 	return (0);
+}
+
+/*
+ * The country the radio is in (two letters, ISO 3166), told to its firmware as Linux's reg.c does on a user's hint: the
+ * firmware answers with that country's rules (WMI_REG_CHAN_LIST_CC), which reach the channels the way its default
+ * ("US") did. The QCA6390 takes it as the current country; the others as their initial one.
+ */
+void
+lx_set_country(struct ieee80211_hw *hw, const char alpha2[2])
+{
+	struct ath11k *ar = hw->priv;
+	int ret;
+
+	if (ar->ab->hw_params.current_cc_support) {
+		memcpy(&ar->alpha2, alpha2, 2);
+		ret = ath11k_reg_set_cc(ar);
+	} else {
+		struct wmi_init_country_params init = {};
+
+		init.flags = ALPHA_IS_SET;
+		memcpy(&init.cc_info.alpha2, alpha2, 2);
+		init.cc_info.alpha2[2] = 0;
+		ret = ath11k_wmi_send_init_country_cmd(ar, init);
+	}
+	/*
+	 * ... and kept: no 802.11d scan, which would take a country from a nearby access point's beacon instead (seen on
+	 * spartan, 19 November: "IN" given, "CN" a minute later, half the 5 GHz channels gone), as reg.c does for a user's hint
+	 */
+	ath11k_mac_11d_scan_stop(ar);
+	ar->regdom_set_by_user = true;
+	lx_tell("lx: the radio is told its country is \"%c%c\": %d\n", alpha2[0], alpha2[1], ret);
 }
